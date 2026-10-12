@@ -48,14 +48,6 @@ def _error(
     )
 
 
-@app.middleware("http")
-async def request_id_middleware(request: Request, call_next):
-    request.state.request_id = request.headers.get("X-Request-Id") or str(uuid4())
-    response = await call_next(request)
-    response.headers["X-Request-Id"] = request.state.request_id
-    return response
-
-
 @app.exception_handler(ServiceError)
 async def service_error_handler(
     request: Request,
