@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
@@ -27,6 +27,28 @@ class AgentRun(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class OutboxJob(Base):
+    """Durable record of work that still needs to be published to a queue."""
+
+    __tablename__ = "outbox_jobs"
+    __table_args__ = (
+        Index("ix_outbox_jobs_status_next_attempt", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    job_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AgentStep(Base):

@@ -2,6 +2,7 @@ from copy import deepcopy
 from datetime import datetime
 from threading import RLock
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import select
 
@@ -12,6 +13,7 @@ from models import (
     AuditLog,
     Checkpoint,
     ModelCall,
+    OutboxJob,
     RunEvent,
     ToolCall,
     UsageRecord,
@@ -260,7 +262,17 @@ class SqlAlchemyRunRepository:
                 payload_json=first_event["payload"],
                 created_at=self._datetime(first_event["created_at"]),
             )
-            db.add_all([db_run, db_event])
+            db_outbox_job = OutboxJob(
+                id=str(uuid4()),
+                job_type="execute_run",
+                payload_json={"run_id": run["id"]},
+                status="pending",
+                attempts=0,
+                max_attempts=10,
+                next_attempt_at=created_at,
+                created_at=created_at,
+            )
+            db.add_all([db_run, db_event, db_outbox_job])
             db.flush()
             return self._run_to_dict(db_run), True
 

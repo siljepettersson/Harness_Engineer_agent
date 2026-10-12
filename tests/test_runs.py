@@ -4,7 +4,17 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, update
 
 from database import SessionLocal
-from models import AgentRun, AgentStep, AuditLog, Checkpoint, ModelCall, RunEvent, ToolCall, UsageRecord
+from models import (
+    AgentRun,
+    AgentStep,
+    AuditLog,
+    Checkpoint,
+    ModelCall,
+    OutboxJob,
+    RunEvent,
+    ToolCall,
+    UsageRecord,
+)
 from main import app
 
 
@@ -17,6 +27,7 @@ class RunApiTest(unittest.TestCase):
                 Checkpoint,
                 ToolCall,
                 ModelCall,
+                OutboxJob,
                 RunEvent,
                 AgentStep,
                 AgentRun,
@@ -52,6 +63,15 @@ class RunApiTest(unittest.TestCase):
         self.assertEqual(events.status_code, 200)
         self.assertEqual(events.json()[0]["event_type"], "run.created")
         self.assertEqual(events.json()[0]["sequence"], 1)
+
+        with SessionLocal() as db:
+            jobs = db.query(OutboxJob).filter_by(
+                job_type="execute_run",
+                status="pending",
+            ).all()
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0].payload_json, {"run_id": run_id})
+            self.assertEqual(jobs[0].attempts, 0)
 
     def test_idempotency_conflict(self) -> None:
         self.client.post("/runs", json=self.payload, headers=self.headers)

@@ -45,6 +45,7 @@ def init_db() -> None:
         AuditLog,
         Checkpoint,
         ModelCall,
+        OutboxJob,
         RunEvent,
         ToolCall,
         UsageRecord,
