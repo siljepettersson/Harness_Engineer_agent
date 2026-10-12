@@ -1,0 +1,19 @@
+[project]
+name = "harness-engineer-agent"
+version = "0.1.0"
+description = "Learning project for building a run API step by step"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "pydantic>=2.9,<3.0",
+    "sqlalchemy>=2.0,<3.0",
+    "uvicorn[standard]>=0.30,<1.0",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "httpx2",
+]
