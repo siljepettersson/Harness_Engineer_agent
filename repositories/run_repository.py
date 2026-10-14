@@ -1,10 +1,10 @@
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select, update
 
 from database import SessionLocal
 from models import (
@@ -104,6 +104,11 @@ class SqlAlchemyRunRepository:
             "error": run.error_json,
             "created_at": run.created_at.isoformat(),
             "updated_at": run.updated_at.isoformat(),
+            "lease_owner": run.lease_owner,
+            "lease_expires_at": (
+                run.lease_expires_at.isoformat() if run.lease_expires_at else None
+            ),
+            "attempts": run.attempts,
         }
 
     @staticmethod
@@ -285,6 +290,89 @@ class SqlAlchemyRunRepository:
                 )
             )
             return self._run_to_dict(run) if run is not None else None
+
+    def claim_run(
+        self,
+        run_id: str,
+        worker_id: str,
+        lease_seconds: int = 300,
+    ) -> dict[str, Any] | None:
+        """Atomically claim a queued run or an expired running lease."""
+        now = datetime.now(timezone.utc)
+        lease_expires_at = now + timedelta(seconds=lease_seconds)
+        with SessionLocal.begin() as db:
+            result = db.execute(
+                update(AgentRun)
+                .where(
+                    AgentRun.id == run_id,
+                    or_(
+                        AgentRun.status == "queued",
+                        and_(
+                            AgentRun.status == "running",
+                            AgentRun.lease_expires_at.is_not(None),
+                            AgentRun.lease_expires_at < now,
+                        ),
+                    ),
+                )
+                .values(
+                    status="running",
+                    lease_owner=worker_id,
+                    lease_expires_at=lease_expires_at,
+                    attempts=AgentRun.attempts + 1,
+                    started_at=func.coalesce(AgentRun.started_at, now),
+                    updated_at=now,
+                )
+            )
+            if result.rowcount != 1:
+                return None
+            run = db.get(AgentRun, run_id)
+            return self._run_to_dict(run) if run is not None else None
+
+    def finish_run(
+        self,
+        run_id: str,
+        worker_id: str,
+        status: str,
+        output: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> bool:
+        """Write a terminal run state only for the current lease owner."""
+        now = datetime.now(timezone.utc)
+        event_type = "run.completed" if status == "succeeded" else "run.failed"
+        with SessionLocal.begin() as db:
+            result = db.execute(
+                update(AgentRun)
+                .where(
+                    AgentRun.id == run_id,
+                    AgentRun.status == "running",
+                    AgentRun.lease_owner == worker_id,
+                )
+                .values(
+                    status=status,
+                    output_json=output,
+                    error_json=error,
+                    ended_at=now,
+                    updated_at=now,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                )
+            )
+            if result.rowcount != 1:
+                return False
+            sequence = db.scalar(
+                select(func.max(RunEvent.sequence)).where(RunEvent.run_id == run_id)
+            ) or 0
+            db.add(
+                RunEvent(
+                    id=str(uuid4()),
+                    run_id=run_id,
+                    sequence=sequence + 1,
+                    event_type=event_type,
+                    payload_json={"status": status},
+                    created_at=now,
+                )
+            )
+            return True
 
     def list_events(self, run_id: str, org_id: str) -> list[dict[str, Any]]:
         with SessionLocal() as db:

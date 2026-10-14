@@ -16,6 +16,7 @@ from models import (
     UsageRecord,
 )
 from main import app
+from repositories.run_repository import run_repository
 
 
 class RunApiTest(unittest.TestCase):
@@ -154,6 +155,40 @@ class RunApiTest(unittest.TestCase):
         )
         self.assertEqual(waiting_resume.status_code, 200)
         self.assertEqual(waiting_resume.json()["status"], "queued")
+
+    def test_run_claim_is_exclusive_and_only_owner_can_finish(self) -> None:
+        created = self.client.post("/runs", json=self.payload, headers=self.headers)
+        run_id = created.json()["run_id"]
+
+        first_claim = run_repository.claim_run(run_id, "worker-a")
+        second_claim = run_repository.claim_run(run_id, "worker-b")
+
+        self.assertIsNotNone(first_claim)
+        self.assertEqual(first_claim["status"], "running")
+        self.assertEqual(first_claim["lease_owner"], "worker-a")
+        self.assertIsNone(second_claim)
+
+        self.assertFalse(
+            run_repository.finish_run(
+                run_id,
+                "worker-b",
+                "succeeded",
+                output={"answer": "not authorized"},
+            )
+        )
+        self.assertTrue(
+            run_repository.finish_run(
+                run_id,
+                "worker-a",
+                "succeeded",
+                output={"answer": "completed"},
+            )
+        )
+
+        stored = run_repository.get(run_id, "org_1")
+        self.assertEqual(stored["status"], "succeeded")
+        self.assertIsNone(stored["lease_owner"])
+        self.assertEqual(stored["attempts"], 1)
 
 
 if __name__ == "__main__":

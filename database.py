@@ -1,6 +1,6 @@
 from collections.abc import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
@@ -52,3 +52,19 @@ def init_db() -> None:
     )
 
     Base.metadata.create_all(bind=engine)
+
+    existing_columns = {
+        column["name"] for column in inspect(engine).get_columns("agent_runs")
+    }
+    additions = {
+        "lease_owner": "VARCHAR(200)",
+        "lease_expires_at": "DATETIME",
+        "attempts": "INTEGER NOT NULL DEFAULT 0",
+    }
+    missing = additions.keys() - existing_columns
+    if missing:
+        with engine.begin() as connection:
+            for name in missing:
+                connection.execute(
+                    text(f"ALTER TABLE agent_runs ADD COLUMN {name} {additions[name]}")
+                )
