@@ -44,6 +44,7 @@ def init_db() -> None:
         AgentStep,
         AuditLog,
         Checkpoint,
+        DeadLetterJob,
         ModelCall,
         OutboxJob,
         RunEvent,

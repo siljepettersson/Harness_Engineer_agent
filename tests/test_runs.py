@@ -11,6 +11,7 @@ from models import (
     AgentStep,
     AuditLog,
     Checkpoint,
+    DeadLetterJob,
     ModelCall,
     OutboxJob,
     RunEvent,
@@ -28,6 +29,7 @@ class RunApiTest(unittest.TestCase):
                 AuditLog,
                 UsageRecord,
                 Checkpoint,
+                DeadLetterJob,
                 ToolCall,
                 ModelCall,
                 OutboxJob,
@@ -219,6 +221,30 @@ class RunApiTest(unittest.TestCase):
             ).all()
             self.assertEqual(len(jobs), 2)
             self.assertTrue(any(job.payload_json == {"run_id": run_id} for job in jobs))
+
+    def test_dead_letter_is_recorded_only_once(self) -> None:
+        error = {"type": "ProviderUnavailable", "message": "temporary outage"}
+        first = run_repository.record_dead_letter(
+            original_job_id="job-123",
+            job_type="execute_run",
+            payload={"run_id": "run-123"},
+            attempts=3,
+            error=error,
+        )
+        second = run_repository.record_dead_letter(
+            original_job_id="job-123",
+            job_type="execute_run",
+            payload={"run_id": "run-123"},
+            attempts=4,
+            error=error,
+        )
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        with SessionLocal() as db:
+            dead_letters = db.query(DeadLetterJob).all()
+            self.assertEqual(len(dead_letters), 1)
+            self.assertEqual(dead_letters[0].attempts, 3)
 
 
 if __name__ == "__main__":

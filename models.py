@@ -54,6 +54,23 @@ class OutboxJob(Base):
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class DeadLetterJob(Base):
+    """A durable record of a job that requires investigation or replay."""
+
+    __tablename__ = "dead_letter_jobs"
+    __table_args__ = (
+        UniqueConstraint("original_job_id", name="uq_dead_letter_original_job"),
+    )
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    original_job_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    job_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False)
+    error_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class AgentStep(Base):
     __tablename__ = "agent_steps"
     __table_args__ = (

@@ -12,6 +12,7 @@ from models import (
     AgentStep,
     AuditLog,
     Checkpoint,
+    DeadLetterJob,
     ModelCall,
     OutboxJob,
     RunEvent,
@@ -428,6 +429,36 @@ class SqlAlchemyRunRepository:
                 recovered += 1
 
         return recovered
+
+    def record_dead_letter(
+        self,
+        original_job_id: str,
+        job_type: str,
+        payload: dict[str, Any],
+        attempts: int,
+        error: dict[str, Any],
+    ) -> bool:
+        """Persist a failed job once so operators can inspect or replay it."""
+        with SessionLocal.begin() as db:
+            existing = db.scalar(
+                select(DeadLetterJob).where(
+                    DeadLetterJob.original_job_id == original_job_id
+                )
+            )
+            if existing is not None:
+                return False
+            db.add(
+                DeadLetterJob(
+                    id=str(uuid4()),
+                    original_job_id=original_job_id,
+                    job_type=job_type,
+                    payload_json=payload,
+                    attempts=attempts,
+                    error_json=error,
+                    created_at=datetime.now(timezone.utc),
+                )
+            )
+            return True
 
     def list_events(self, run_id: str, org_id: str) -> list[dict[str, Any]]:
         with SessionLocal() as db:

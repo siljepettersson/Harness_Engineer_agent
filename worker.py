@@ -1,4 +1,9 @@
 from celery_app import celery_app
+from repositories.run_repository import run_repository
+
+
+class RetryableRunError(RuntimeError):
+    """A dependency failure that may succeed when retried later."""
 
 
 @celery_app.task(
@@ -6,11 +11,23 @@ from celery_app import celery_app
     name="agent_harness.execute_run",
     acks_late=True,
     reject_on_worker_lost=True,
+    max_retries=3,
 )
 def execute_run(self, run_id: str):
     """Celery entry point for the Harness Loop executor."""
     from services.run_executor import run_executor
 
     worker_id = self.request.hostname or self.request.id or "unknown-worker"
-    return run_executor.execute(run_id=run_id, worker_id=worker_id)
-
+    try:
+        return run_executor.execute(run_id=run_id, worker_id=worker_id)
+    except RetryableRunError as exc:
+        if self.request.retries >= self.max_retries:
+            run_repository.record_dead_letter(
+                original_job_id=self.request.id or run_id,
+                job_type="execute_run",
+                payload={"run_id": run_id},
+                attempts=self.request.retries + 1,
+                error={"type": type(exc).__name__, "message": str(exc)},
+            )
+            raise
+        raise self.retry(exc=exc, countdown=2 ** self.request.retries)
