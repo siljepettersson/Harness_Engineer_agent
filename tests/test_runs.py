@@ -1,6 +1,8 @@
 import unittest
 
 from fastapi.testclient import TestClient
+from datetime import datetime, timedelta, timezone
+
 from sqlalchemy import delete, update
 
 from database import SessionLocal
@@ -189,6 +191,34 @@ class RunApiTest(unittest.TestCase):
         self.assertEqual(stored["status"], "succeeded")
         self.assertIsNone(stored["lease_owner"])
         self.assertEqual(stored["attempts"], 1)
+
+    def test_expired_lease_is_requeued_with_a_new_outbox_job(self) -> None:
+        created = self.client.post("/runs", json=self.payload, headers=self.headers)
+        run_id = created.json()["run_id"]
+        claimed = run_repository.claim_run(run_id, "worker-a", lease_seconds=1)
+        self.assertIsNotNone(claimed)
+
+        with SessionLocal.begin() as db:
+            db.execute(
+                update(AgentRun)
+                .where(AgentRun.id == run_id)
+                .values(
+                    lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1)
+                )
+            )
+
+        self.assertEqual(run_repository.recover_expired_leases(), 1)
+        stored = run_repository.get(run_id, "org_1")
+        self.assertEqual(stored["status"], "queued")
+        self.assertIsNone(stored["lease_owner"])
+
+        with SessionLocal() as db:
+            jobs = db.query(OutboxJob).filter_by(
+                job_type="execute_run",
+                status="pending",
+            ).all()
+            self.assertEqual(len(jobs), 2)
+            self.assertTrue(any(job.payload_json == {"run_id": run_id} for job in jobs))
 
 
 if __name__ == "__main__":

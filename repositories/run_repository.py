@@ -374,6 +374,61 @@ class SqlAlchemyRunRepository:
             )
             return True
 
+    def recover_expired_leases(self, limit: int = 100) -> int:
+        """Return expired running leases to the queue with a new outbox job."""
+        now = datetime.now(timezone.utc)
+        recovered = 0
+        with SessionLocal.begin() as db:
+            runs = db.scalars(
+                select(AgentRun)
+                .where(
+                    AgentRun.status == "running",
+                    AgentRun.lease_expires_at.is_not(None),
+                    AgentRun.lease_expires_at <= now,
+                )
+                .order_by(AgentRun.lease_expires_at.asc())
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            ).all()
+
+            for run in runs:
+                previous_owner = run.lease_owner
+                run.status = "queued"
+                run.lease_owner = None
+                run.lease_expires_at = None
+                run.updated_at = now
+
+                last_sequence = db.scalar(
+                    select(func.max(RunEvent.sequence)).where(
+                        RunEvent.run_id == run.id
+                    )
+                ) or 0
+                db.add(
+                    RunEvent(
+                        id=str(uuid4()),
+                        run_id=run.id,
+                        sequence=last_sequence + 1,
+                        event_type="run.lease_expired",
+                        payload_json={"previous_owner": previous_owner},
+                        created_at=now,
+                    )
+                )
+                db.add(
+                    OutboxJob(
+                        id=str(uuid4()),
+                        job_type="execute_run",
+                        payload_json={"run_id": run.id},
+                        status="pending",
+                        attempts=0,
+                        max_attempts=10,
+                        next_attempt_at=now,
+                        created_at=now,
+                    )
+                )
+                recovered += 1
+
+        return recovered
+
     def list_events(self, run_id: str, org_id: str) -> list[dict[str, Any]]:
         with SessionLocal() as db:
             events = db.scalars(
