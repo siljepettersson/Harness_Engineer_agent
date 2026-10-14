@@ -60,6 +60,7 @@ def init_db() -> None:
     additions = {
         "lease_owner": "VARCHAR(200)",
         "lease_expires_at": "DATETIME",
+        "cancel_requested_at": "DATETIME",
         "attempts": "INTEGER NOT NULL DEFAULT 0",
     }
     missing = additions.keys() - existing_columns

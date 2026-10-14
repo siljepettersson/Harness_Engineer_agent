@@ -69,6 +69,9 @@ class RunExecutor:
 
         try:
             for step_index in range(1, self.max_steps + 1):
+                if self.repository.cancel_if_requested(run_id, worker_id):
+                    return {"run_id": run_id, "status": "cancelled"}
+
                 started_at = self._now()
                 decision = self.model_provider.complete(
                     context=context,
@@ -119,6 +122,9 @@ class RunExecutor:
 
                 if decision.tool_arguments is None:
                     raise ValueError("Tool decision is missing arguments")
+
+                if self.repository.cancel_if_requested(run_id, worker_id):
+                    return {"run_id": run_id, "status": "cancelled"}
 
                 idempotency_key = self._tool_idempotency_key(
                     run,

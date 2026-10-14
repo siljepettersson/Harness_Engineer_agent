@@ -9,6 +9,7 @@ from schemas import (
     ResumeRunRequest,
     RunResponse,
 )
+from state_machine import InvalidRunTransition
 
 
 class ServiceError(Exception):
@@ -20,8 +21,6 @@ class ServiceError(Exception):
 
 
 class RunService:
-    TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
-
     def __init__(self, repository: RunRepository) -> None:
         self.repository = repository
 
@@ -150,30 +149,30 @@ class RunService:
         request: CancelRunRequest,
     ) -> RunResponse:
         run = self._get_authorized_run(run_id, org_id)
-        if run["status"] in self.TERMINAL_STATUSES:
+        # Preserve the API's established terminal-cancel contract while the
+        # repository still enforces InvalidRunTransition for all transitions.
+        if run["status"] in {"succeeded", "failed", "cancelled"}:
             raise ServiceError(
                 409,
                 "RUN_ALREADY_TERMINAL",
                 "Run is already terminal",
             )
-
-        updated_run, transitioned = self.repository.transition_and_append_event(
-            run_id,
-            org_id,
-            "cancelled",
-            self._now(),
-            self._event(
-                run_id,
-                "run.cancelled",
-                {
-                    "status": "cancelled",
-                    "reason": request.reason,
-                    "cancelled_by": user_id,
-                },
-            ),
-        )
-        if not transitioned or updated_run is None:
+        try:
+            updated_run = self.repository.request_cancel(
+                run_id=run_id,
+                org_id=org_id,
+                actor_type="user",
+                actor_id=user_id,
+                reason=request.reason,
+            )
+        except KeyError:
             raise self._not_found()
+        except InvalidRunTransition as exc:
+            raise ServiceError(
+                409,
+                "INVALID_RUN_TRANSITION",
+                str(exc),
+            )
         return self._to_response(updated_run)
 
     def resume_run(
@@ -184,29 +183,20 @@ class RunService:
         request: ResumeRunRequest,
     ) -> RunResponse:
         self._get_authorized_run(run_id, org_id)
-        updated_run, transitioned = self.repository.transition_and_append_event(
-            run_id,
-            org_id,
-            "queued",
-            self._now(),
-            self._event(
-                run_id,
-                "run.resumed",
-                {
-                    "status": "queued",
-                    "resumed_by": user_id,
+        try:
+            updated_run = self.repository.resume_run(
+                run_id=run_id,
+                org_id=org_id,
+                actor_id=user_id,
+                resume_payload={
                     "resume_token": request.resume_token,
                     "input": request.input,
                 },
-            ),
-            expected_status="waiting_for_user",
-        )
-        if not transitioned or updated_run is None:
-            raise ServiceError(
-                409,
-                "RUN_NOT_WAITING_FOR_USER",
-                "Only a run with status waiting_for_user can be resumed",
             )
+        except KeyError:
+            raise self._not_found()
+        except InvalidRunTransition as exc:
+            raise ServiceError(409, "INVALID_RUN_TRANSITION", str(exc))
         return self._to_response(updated_run)
 
     def get_trace(self, run_id: str, org_id: str) -> dict[str, Any]:

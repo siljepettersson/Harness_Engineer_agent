@@ -19,6 +19,12 @@ from models import (
     ToolCall,
     UsageRecord,
 )
+from state_machine import (
+    ALLOWED_RUN_TRANSITIONS,
+    InvalidRunTransition,
+    apply_status_fields,
+    event_type_for_transition,
+)
 
 
 # Kapittel 1 bruker minne som en enkel databaseimitasjon.
@@ -108,6 +114,11 @@ class SqlAlchemyRunRepository:
             "lease_owner": run.lease_owner,
             "lease_expires_at": (
                 run.lease_expires_at.isoformat() if run.lease_expires_at else None
+            ),
+            "cancel_requested_at": (
+                run.cancel_requested_at.isoformat()
+                if run.cancel_requested_at
+                else None
             ),
             "attempts": run.attempts,
         }
@@ -298,36 +309,32 @@ class SqlAlchemyRunRepository:
         worker_id: str,
         lease_seconds: int = 300,
     ) -> dict[str, Any] | None:
-        """Atomically claim a queued run or an expired running lease."""
+        """Atomically transition a queued run to running and claim its lease."""
         now = datetime.now(timezone.utc)
         lease_expires_at = now + timedelta(seconds=lease_seconds)
         with SessionLocal.begin() as db:
-            result = db.execute(
-                update(AgentRun)
-                .where(
-                    AgentRun.id == run_id,
-                    or_(
-                        AgentRun.status == "queued",
-                        and_(
-                            AgentRun.status == "running",
-                            AgentRun.lease_expires_at.is_not(None),
-                            AgentRun.lease_expires_at < now,
-                        ),
-                    ),
-                )
-                .values(
-                    status="running",
-                    lease_owner=worker_id,
-                    lease_expires_at=lease_expires_at,
-                    attempts=AgentRun.attempts + 1,
-                    started_at=func.coalesce(AgentRun.started_at, now),
-                    updated_at=now,
-                )
+            run = db.scalar(
+                select(AgentRun)
+                .where(AgentRun.id == run_id)
+                .with_for_update()
             )
-            if result.rowcount != 1:
+            if run is None or run.status != "queued":
                 return None
-            run = db.get(AgentRun, run_id)
-            return self._run_to_dict(run) if run is not None else None
+
+            transitioned = self._transition_in_tx(
+                db,
+                run,
+                to_status="running",
+                reason="worker_claimed_run",
+                actor_type="worker",
+                actor_id=worker_id,
+                payload={"lease_expires_at": lease_expires_at.isoformat()},
+            )
+            run.lease_owner = worker_id
+            run.lease_expires_at = lease_expires_at
+            run.attempts += 1
+            db.flush()
+            return self._run_to_dict(transitioned)
 
     def finish_run(
         self,
@@ -337,41 +344,29 @@ class SqlAlchemyRunRepository:
         output: dict[str, Any] | None = None,
         error: dict[str, Any] | None = None,
     ) -> bool:
-        """Write a terminal run state only for the current lease owner."""
-        now = datetime.now(timezone.utc)
-        event_type = "run.completed" if status == "succeeded" else "run.failed"
+        """Transition a leased running run to a terminal state."""
         with SessionLocal.begin() as db:
-            result = db.execute(
-                update(AgentRun)
+            run = db.scalar(
+                select(AgentRun)
                 .where(
                     AgentRun.id == run_id,
                     AgentRun.status == "running",
                     AgentRun.lease_owner == worker_id,
                 )
-                .values(
-                    status=status,
-                    output_json=output,
-                    error_json=error,
-                    ended_at=now,
-                    updated_at=now,
-                    lease_owner=None,
-                    lease_expires_at=None,
-                )
+                .with_for_update()
             )
-            if result.rowcount != 1:
+            if run is None:
                 return False
-            sequence = db.scalar(
-                select(func.max(RunEvent.sequence)).where(RunEvent.run_id == run_id)
-            ) or 0
-            db.add(
-                RunEvent(
-                    id=str(uuid4()),
-                    run_id=run_id,
-                    sequence=sequence + 1,
-                    event_type=event_type,
-                    payload_json={"status": status},
-                    created_at=now,
-                )
+            self._transition_in_tx(
+                db,
+                run,
+                to_status=status,
+                reason="run_finished" if status == "succeeded" else "run_failed",
+                actor_type="worker",
+                actor_id=worker_id,
+                payload={"output": output} if output is not None else {},
+                output=output,
+                error=error,
             )
             return True
 
@@ -394,25 +389,14 @@ class SqlAlchemyRunRepository:
 
             for run in runs:
                 previous_owner = run.lease_owner
-                run.status = "queued"
-                run.lease_owner = None
-                run.lease_expires_at = None
-                run.updated_at = now
-
-                last_sequence = db.scalar(
-                    select(func.max(RunEvent.sequence)).where(
-                        RunEvent.run_id == run.id
-                    )
-                ) or 0
-                db.add(
-                    RunEvent(
-                        id=str(uuid4()),
-                        run_id=run.id,
-                        sequence=last_sequence + 1,
-                        event_type="run.lease_expired",
-                        payload_json={"previous_owner": previous_owner},
-                        created_at=now,
-                    )
+                self._transition_in_tx(
+                    db,
+                    run,
+                    to_status="queued",
+                    reason="worker_lease_expired",
+                    actor_type="system",
+                    actor_id="lease_sweeper",
+                    payload={"previous_owner": previous_owner},
                 )
                 db.add(
                     OutboxJob(
@@ -429,6 +413,258 @@ class SqlAlchemyRunRepository:
                 recovered += 1
 
         return recovered
+
+    def transition_run(
+        self,
+        run_id: str,
+        to_status: str,
+        reason: str,
+        actor_type: str,
+        actor_id: str,
+        payload: dict[str, Any] | None = None,
+        org_id: str | None = None,
+        expected_status: str | None = None,
+        output: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Apply the only supported run-status transition.
+
+        The row lock, whitelist, derived fields, event, and audit record all
+        live in one transaction. Callers must not assign AgentRun.status.
+        """
+        with SessionLocal.begin() as db:
+            filters = [AgentRun.id == run_id]
+            if org_id is not None:
+                filters.append(AgentRun.org_id == org_id)
+            run = db.scalar(
+                select(AgentRun).where(*filters).with_for_update()
+            )
+            if run is None:
+                raise KeyError(run_id)
+            if expected_status is not None and run.status != expected_status:
+                raise InvalidRunTransition(run.status, to_status)
+            self._transition_in_tx(
+                db,
+                run,
+                to_status=to_status,
+                reason=reason,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                payload=payload,
+                output=output,
+                error=error,
+            )
+            return self._run_to_dict(run)
+
+    def _transition_in_tx(
+        self,
+        db,
+        run: AgentRun,
+        to_status: str,
+        reason: str,
+        actor_type: str,
+        actor_id: str,
+        payload: dict[str, Any] | None = None,
+        output: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> AgentRun:
+        from_status = run.status
+        allowed = ALLOWED_RUN_TRANSITIONS.get(from_status, set())
+        if to_status not in allowed:
+            raise InvalidRunTransition(from_status, to_status)
+
+        now = datetime.now(timezone.utc)
+        apply_status_fields(run, to_status, now)
+        if output is not None:
+            run.output_json = output
+        if error is not None:
+            run.error_json = error
+
+        last_sequence = db.scalar(
+            select(func.max(RunEvent.sequence)).where(RunEvent.run_id == run.id)
+        ) or 0
+        event_payload = {
+            "from_status": from_status,
+            "to_status": to_status,
+            "reason": reason,
+            "actor_type": actor_type,
+            "actor_id": actor_id,
+            **(payload or {}),
+        }
+        db.add(
+            RunEvent(
+                id=str(uuid4()),
+                run_id=run.id,
+                sequence=last_sequence + 1,
+                event_type=event_type_for_transition(from_status, to_status),
+                payload_json=event_payload,
+                created_at=now,
+            )
+        )
+        db.add(
+            AuditLog(
+                id=str(uuid4()),
+                org_id=run.org_id,
+                actor=f"{actor_type}:{actor_id}",
+                run_id=run.id,
+                action="run.transition",
+                target_type="agent_run",
+                target_id=run.id,
+                metadata_json={
+                    "from_status": from_status,
+                    "to_status": to_status,
+                    "reason": reason,
+                    "actor_type": actor_type,
+                    "actor_id": actor_id,
+                },
+                created_at=now,
+            )
+        )
+        db.flush()
+        return run
+
+    def request_cancel(
+        self,
+        run_id: str,
+        org_id: str,
+        actor_type: str,
+        actor_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Cancel an idle run or record a cooperative cancel request."""
+        with SessionLocal.begin() as db:
+            run = db.scalar(
+                select(AgentRun)
+                .where(AgentRun.id == run_id, AgentRun.org_id == org_id)
+                .with_for_update()
+            )
+            if run is None:
+                raise KeyError(run_id)
+
+            if run.status in {"queued", "waiting_for_user"}:
+                self._transition_in_tx(
+                    db,
+                    run,
+                    to_status="cancelled",
+                    reason=reason,
+                    actor_type=actor_type,
+                    actor_id=actor_id,
+                )
+            elif run.status == "running":
+                now = datetime.now(timezone.utc)
+                run.cancel_requested_at = now
+                run.updated_at = now
+                last_sequence = db.scalar(
+                    select(func.max(RunEvent.sequence)).where(
+                        RunEvent.run_id == run.id
+                    )
+                ) or 0
+                payload = {
+                    "reason": reason,
+                    "actor_type": actor_type,
+                    "actor_id": actor_id,
+                }
+                db.add(
+                    RunEvent(
+                        id=str(uuid4()),
+                        run_id=run.id,
+                        sequence=last_sequence + 1,
+                        event_type="run.cancel_requested",
+                        payload_json=payload,
+                        created_at=now,
+                    )
+                )
+                db.add(
+                    AuditLog(
+                        id=str(uuid4()),
+                        org_id=run.org_id,
+                        actor=f"{actor_type}:{actor_id}",
+                        run_id=run.id,
+                        action="run.cancel_requested",
+                        target_type="agent_run",
+                        target_id=run.id,
+                        metadata_json=payload,
+                        created_at=now,
+                    )
+                )
+                db.flush()
+            else:
+                raise InvalidRunTransition(run.status, "cancelled")
+
+            return self._run_to_dict(run)
+
+    def resume_run(
+        self,
+        run_id: str,
+        org_id: str,
+        actor_id: str,
+        resume_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Resume a waiting run and enqueue the next execution atomically."""
+        with SessionLocal.begin() as db:
+            run = db.scalar(
+                select(AgentRun)
+                .where(AgentRun.id == run_id, AgentRun.org_id == org_id)
+                .with_for_update()
+            )
+            if run is None:
+                raise KeyError(run_id)
+
+            self._transition_in_tx(
+                db,
+                run,
+                to_status="queued",
+                reason="user_resumed_run",
+                actor_type="user",
+                actor_id=actor_id,
+                payload=resume_payload,
+            )
+            now = datetime.now(timezone.utc)
+            db.add(
+                OutboxJob(
+                    id=str(uuid4()),
+                    job_type="execute_run",
+                    payload_json={"run_id": run.id},
+                    status="pending",
+                    attempts=0,
+                    max_attempts=10,
+                    next_attempt_at=now,
+                    created_at=now,
+                )
+            )
+            db.flush()
+            return self._run_to_dict(run)
+
+    def cancel_if_requested(
+        self,
+        run_id: str,
+        worker_id: str,
+    ) -> bool:
+        """Perform a cooperative cancellation at a worker safe point."""
+        with SessionLocal.begin() as db:
+            run = db.scalar(
+                select(AgentRun)
+                .where(
+                    AgentRun.id == run_id,
+                    AgentRun.status == "running",
+                    AgentRun.lease_owner == worker_id,
+                )
+                .with_for_update()
+            )
+            if run is None or run.cancel_requested_at is None:
+                return False
+            self._transition_in_tx(
+                db,
+                run,
+                to_status="cancelled",
+                reason="cancel_request_reached_safe_point",
+                actor_type="worker",
+                actor_id=worker_id,
+                payload={
+                    "cancel_requested_at": run.cancel_requested_at.isoformat(),
+                },
+            )
+            return True
 
     def record_dead_letter(
         self,
@@ -482,40 +718,22 @@ class SqlAlchemyRunRepository:
         event: dict[str, Any],
         expected_status: str | None = None,
     ) -> tuple[dict[str, Any] | None, bool]:
-        """Update status and append the event in one database transaction."""
-        with SessionLocal.begin() as db:
-            run = db.scalar(
-                select(AgentRun).where(
-                    AgentRun.id == run_id,
-                    AgentRun.org_id == org_id,
-                )
+        """Compatibility wrapper; new code must use ``transition_run``."""
+        payload = event.get("payload", {})
+        try:
+            updated = self.transition_run(
+                run_id=run_id,
+                org_id=org_id,
+                to_status=status,
+                reason=payload.get("reason", "legacy_transition"),
+                actor_type=payload.get("actor_type", "system"),
+                actor_id=payload.get("actor_id", "legacy"),
+                payload=payload,
+                expected_status=expected_status,
             )
-            if run is None:
-                return None, False
-
-            if expected_status is not None and run.status != expected_status:
-                return self._run_to_dict(run), False
-
-            last_sequence = db.scalar(
-                select(RunEvent.sequence)
-                .where(RunEvent.run_id == run_id)
-                .order_by(RunEvent.sequence.desc())
-                .limit(1)
-            )
-            run.status = status
-            run.updated_at = self._datetime(updated_at)
-            db.add(
-                RunEvent(
-                    id=event["id"],
-                    run_id=run_id,
-                    sequence=(last_sequence or 0) + 1,
-                    event_type=event["event_type"],
-                    payload_json=event["payload"],
-                    created_at=self._datetime(event["created_at"]),
-                )
-            )
-            db.flush()
-            return self._run_to_dict(run), True
+        except (KeyError, InvalidRunTransition):
+            return None, False
+        return updated, True
 
     def create_step(self, org_id: str, step: dict[str, Any]) -> dict[str, Any]:
         with SessionLocal.begin() as db:
