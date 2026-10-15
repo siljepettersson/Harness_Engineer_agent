@@ -1,8 +1,8 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from database import SessionLocal
 from models import AgentRun, AuditLog, RunEvent
@@ -144,3 +144,69 @@ def test_transition_run_rejects_terminal_run():
 
     assert raised.value.from_status == "succeeded"
     assert raised.value.to_status == "running"
+
+
+def test_worker_claim_and_finish_use_transition_events():
+    run_id = _create_test_run()
+
+    claimed = run_repository.claim_run(run_id, "worker-integration")
+    assert claimed is not None
+    assert claimed["status"] == "running"
+
+    assert run_repository.finish_run(
+        run_id,
+        "worker-integration",
+        "succeeded",
+        output={"answer": "done"},
+    )
+
+    with SessionLocal() as db:
+        event_types = [
+            event.event_type
+            for event in db.scalars(
+                select(RunEvent)
+                .where(RunEvent.run_id == run_id)
+                .order_by(RunEvent.sequence)
+            ).all()
+        ]
+
+    assert event_types == ["run.created", "run.started", "run.completed"]
+
+
+def test_sweeper_requeues_through_the_transition_path():
+    run_id = _create_test_run()
+    assert run_repository.claim_run(run_id, "worker-expired") is not None
+
+    with SessionLocal.begin() as db:
+        db.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id)
+            .values(
+                lease_expires_at=(
+                    datetime.now(timezone.utc) - timedelta(seconds=1)
+                )
+            )
+        )
+
+    assert run_repository.recover_expired_leases() == 1
+    assert run_repository.get(run_id, "state-machine-tests")["status"] == "queued"
+
+    with SessionLocal() as db:
+        event = db.scalar(
+            select(RunEvent)
+            .where(
+                RunEvent.run_id == run_id,
+                RunEvent.event_type == "run.retry_scheduled",
+            )
+        )
+        audit = db.scalar(
+            select(AuditLog).where(
+                AuditLog.run_id == run_id,
+                AuditLog.action == "run.transition",
+            ).order_by(AuditLog.created_at.desc())
+        )
+
+    assert event is not None
+    assert event.payload_json["reason"] == "worker_lease_expired"
+    assert audit is not None
+    assert audit.metadata_json["actor_id"] == "lease_sweeper"
