@@ -27,12 +27,41 @@ ALLOWED_RUN_TRANSITIONS: dict[str, set[str]] = {
 }
 
 
+ALLOWED_RUN_ACTORS: dict[tuple[str, str], set[str]] = {
+    ("queued", "running"): {"worker"},
+    ("queued", "cancelled"): {"user", "api", "system"},
+    ("running", "queued"): {"worker", "system"},
+    ("running", "waiting_for_user"): {"worker"},
+    ("running", "succeeded"): {"worker"},
+    ("running", "failed"): {"worker", "system"},
+    ("running", "cancelled"): {"worker"},
+    ("waiting_for_user", "queued"): {"user", "api"},
+    ("waiting_for_user", "cancelled"): {"user", "api"},
+}
+
+
 class InvalidRunTransition(Exception):
     def __init__(self, from_status: str, to_status: str) -> None:
         self.from_status = from_status
         self.to_status = to_status
         super().__init__(
             f"Cannot transition from {from_status} to {to_status}"
+        )
+
+
+class UnauthorizedRunActor(Exception):
+    def __init__(
+        self,
+        from_status: str,
+        to_status: str,
+        actor_type: str,
+    ) -> None:
+        self.from_status = from_status
+        self.to_status = to_status
+        self.actor_type = actor_type
+        super().__init__(
+            f"Actor {actor_type} cannot transition "
+            f"from {from_status} to {to_status}"
         )
 
 

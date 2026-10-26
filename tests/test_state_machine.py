@@ -11,6 +11,7 @@ from state_machine import (
     ALLOWED_RUN_TRANSITIONS,
     InvalidRunTransition,
     RUN_TERMINAL_STATUSES,
+    UnauthorizedRunActor,
 )
 
 
@@ -71,6 +72,40 @@ def test_invalid_transition_preserves_both_statuses_for_api_errors():
     assert error.from_status == "succeeded"
     assert error.to_status == "running"
     assert str(error) == "Cannot transition from succeeded to running"
+
+
+def test_actor_matrix_rejects_worker_resuming_a_waiting_run():
+    run_id = _create_test_run()
+    run_repository.transition_run(
+        run_id=run_id,
+        org_id="state-machine-tests",
+        to_status="running",
+        reason="test_start",
+        actor_type="worker",
+        actor_id="worker-test",
+    )
+    run_repository.transition_run(
+        run_id=run_id,
+        org_id="state-machine-tests",
+        to_status="waiting_for_user",
+        reason="needs_approval",
+        actor_type="worker",
+        actor_id="worker-test",
+    )
+
+    with pytest.raises(UnauthorizedRunActor) as raised:
+        run_repository.transition_run(
+            run_id=run_id,
+            org_id="state-machine-tests",
+            to_status="queued",
+            reason="worker_resume_attempt",
+            actor_type="worker",
+            actor_id="worker-test",
+        )
+
+    assert raised.value.from_status == "waiting_for_user"
+    assert raised.value.to_status == "queued"
+    assert raised.value.actor_type == "worker"
 
 
 def test_transition_run_writes_event_and_audit_atomically():

@@ -22,6 +22,7 @@ from models import (
 from state_machine import (
     ALLOWED_RUN_TRANSITIONS,
     InvalidRunTransition,
+    UnauthorizedRunActor,
     apply_status_fields,
     event_type_for_transition,
 )
@@ -472,6 +473,9 @@ class SqlAlchemyRunRepository:
         allowed = ALLOWED_RUN_TRANSITIONS.get(from_status, set())
         if to_status not in allowed:
             raise InvalidRunTransition(from_status, to_status)
+        allowed_actors = self._allowed_actors(from_status, to_status)
+        if actor_type not in allowed_actors:
+            raise UnauthorizedRunActor(from_status, to_status, actor_type)
 
         now = datetime.now(timezone.utc)
         apply_status_fields(run, to_status, now)
@@ -522,6 +526,12 @@ class SqlAlchemyRunRepository:
         )
         db.flush()
         return run
+
+    @staticmethod
+    def _allowed_actors(from_status: str, to_status: str) -> set[str]:
+        from state_machine import ALLOWED_RUN_ACTORS
+
+        return ALLOWED_RUN_ACTORS.get((from_status, to_status), set())
 
     def request_cancel(
         self,
