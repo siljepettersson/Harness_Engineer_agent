@@ -1,7 +1,8 @@
 import unittest
 from uuid import uuid4
 
-from fastapi.testclient import TestClient
+import anyio
+from httpx import ASGITransport, AsyncClient
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import delete, update
@@ -23,6 +24,32 @@ from main import app
 from repositories.run_repository import run_repository
 
 
+class SyncASGIClient:
+    """Synchronous test facade without Starlette's broken AnyIO portal."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    def request(self, method: str, url: str, **kwargs):
+        async def send_request():
+            async with AsyncClient(
+                transport=ASGITransport(app=self.app),
+                base_url="http://testserver",
+            ) as client:
+                return await client.request(method, url, **kwargs)
+
+        return anyio.run(send_request)
+
+    def get(self, url: str, **kwargs):
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs):
+        return self.request("POST", url, **kwargs)
+
+    def close(self) -> None:
+        return None
+
+
 class RunApiTest(unittest.TestCase):
     def setUp(self) -> None:
         with SessionLocal.begin() as db:
@@ -39,7 +66,7 @@ class RunApiTest(unittest.TestCase):
                 AgentRun,
             ):
                 db.execute(delete(model))
-        self.client = TestClient(app)
+        self.client = SyncASGIClient(app)
         self.headers = {
             "X-Org-Id": "org_1",
             "X-User-Id": "user_1",
@@ -53,6 +80,9 @@ class RunApiTest(unittest.TestCase):
                 "message": "Jeg ønsker refusjon.",
             },
         }
+
+    def tearDown(self) -> None:
+        self.client.close()
 
     def test_create_idempotency_and_events(self) -> None:
         first = self.client.post("/runs", json=self.payload, headers=self.headers)

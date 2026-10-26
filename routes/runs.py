@@ -15,7 +15,7 @@ from services.run_service import run_service
 router = APIRouter(prefix="/runs", tags=["runs"])
 
 
-def _headers(
+async def _headers(
     x_org_id: str = Header(..., alias="X-Org-Id"),
     x_user_id: str = Header(..., alias="X-User-Id"),
 ) -> tuple[str, str]:
@@ -23,7 +23,7 @@ def _headers(
 
 
 @router.post("", response_model=RunResponse, status_code=201)
-def create_run(
+async def create_run(
     body: CreateRunRequest,
     response: Response,
     headers: tuple[str, str] = Depends(_headers),
@@ -36,7 +36,7 @@ def create_run(
 
 
 @router.get("/{run_id}", response_model=RunResponse)
-def get_run(
+async def get_run(
     run_id: str,
     headers: tuple[str, str] = Depends(_headers),
 ) -> RunResponse:
@@ -45,7 +45,7 @@ def get_run(
 
 
 @router.get("/{run_id}/events", response_model=list[RunEventRecord])
-def get_run_events(
+async def get_run_events(
     run_id: str,
     headers: tuple[str, str] = Depends(_headers),
 ) -> list[RunEventRecord]:
@@ -57,7 +57,7 @@ def get_run_events(
 
 
 @router.post("/{run_id}/cancel", response_model=RunResponse)
-def cancel_run(
+async def cancel_run(
     run_id: str,
     body: CancelRunRequest,
     headers: tuple[str, str] = Depends(_headers),
@@ -67,7 +67,7 @@ def cancel_run(
 
 
 @router.post("/{run_id}/resume", response_model=RunResponse)
-def resume_run(
+async def resume_run(
     run_id: str,
     body: ResumeRunRequest,
     headers: tuple[str, str] = Depends(_headers),
@@ -77,7 +77,7 @@ def resume_run(
 
 
 @router.post("/{run_id}/rerun", response_model=RunResponse, status_code=201)
-def rerun_run(
+async def rerun_run(
     run_id: str,
     body: RerunRunRequest,
     headers: tuple[str, str] = Depends(_headers),
@@ -87,7 +87,7 @@ def rerun_run(
 
 
 @router.get("/{run_id}/trace", response_model=TraceResponse)
-def get_run_trace(
+async def get_run_trace(
     run_id: str,
     headers: tuple[str, str] = Depends(_headers),
 ) -> TraceResponse:
