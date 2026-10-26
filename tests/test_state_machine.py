@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import select, update
 
 from database import SessionLocal
-from models import AgentRun, AuditLog, RunEvent
+from models import AgentRun, AgentStep, AuditLog, Checkpoint, OutboxJob, RunEvent
 from repositories.run_repository import run_repository
 from state_machine import (
     ALLOWED_RUN_TRANSITIONS,
@@ -245,3 +245,66 @@ def test_sweeper_requeues_through_the_transition_path():
     assert event.payload_json["reason"] == "worker_lease_expired"
     assert audit is not None
     assert audit.metadata_json["actor_id"] == "lease_sweeper"
+
+
+def test_wait_for_user_persists_step_checkpoint_and_resume_atomically():
+    run_id = _create_test_run()
+    assert run_repository.claim_run(run_id, "worker-waiting") is not None
+    step_id = str(uuid4())
+    started_at = datetime.now(timezone.utc)
+    with SessionLocal.begin() as db:
+        db.add(
+            AgentStep(
+                id=step_id,
+                run_id=run_id,
+                step_index=1,
+                step_type="agent_loop",
+                name="refund_order",
+                status="pending",
+                input_json={},
+                output_json=None,
+                error_json=None,
+                started_at=started_at,
+                ended_at=None,
+            )
+        )
+
+    waiting = run_repository.wait_for_user(
+        run_id=run_id,
+        org_id="state-machine-tests",
+        worker_id="worker-waiting",
+        step_id=step_id,
+        checkpoint_state={"current_step": "refund_order"},
+        reason="supervisor_required",
+    )
+    assert waiting["status"] == "waiting_for_user"
+    assert waiting["lease_owner"] is None
+
+    with SessionLocal() as db:
+        step = db.get(AgentStep, step_id)
+        checkpoint = db.scalar(
+            select(Checkpoint).where(Checkpoint.run_id == run_id)
+        )
+    assert step is not None
+    assert step.status == "waiting"
+    assert checkpoint is not None
+    assert checkpoint.state_json == {"current_step": "refund_order"}
+
+    resumed = run_repository.resume_run(
+        run_id=run_id,
+        org_id="state-machine-tests",
+        actor_id="user-test",
+        resume_payload={"approved": True},
+    )
+    assert resumed["status"] == "queued"
+    with SessionLocal() as db:
+        step = db.get(AgentStep, step_id)
+        jobs = db.scalars(
+            select(OutboxJob).where(
+                OutboxJob.job_type == "execute_run",
+                OutboxJob.payload_json == {"run_id": run_id},
+            )
+        ).all()
+    assert step is not None
+    assert step.status == "pending"
+    assert jobs

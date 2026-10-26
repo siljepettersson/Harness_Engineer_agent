@@ -629,6 +629,16 @@ class SqlAlchemyRunRepository:
                 actor_id=actor_id,
                 payload=resume_payload,
             )
+            waiting_step = db.scalar(
+                select(AgentStep)
+                .where(
+                    AgentStep.run_id == run.id,
+                    AgentStep.status == "waiting",
+                )
+                .order_by(AgentStep.step_index.desc())
+            )
+            if waiting_step is not None:
+                waiting_step.status = "pending"
             now = datetime.now(timezone.utc)
             db.add(
                 OutboxJob(
@@ -640,6 +650,70 @@ class SqlAlchemyRunRepository:
                     max_attempts=10,
                     next_attempt_at=now,
                     created_at=now,
+                )
+            )
+            db.flush()
+            return self._run_to_dict(run)
+
+    def wait_for_user(
+        self,
+        run_id: str,
+        org_id: str,
+        worker_id: str,
+        step_id: str,
+        checkpoint_state: dict[str, Any],
+        reason: str,
+    ) -> dict[str, Any]:
+        """Pause a run and persist its waiting step and checkpoint atomically."""
+        with SessionLocal.begin() as db:
+            run = db.scalar(
+                select(AgentRun)
+                .where(
+                    AgentRun.id == run_id,
+                    AgentRun.org_id == org_id,
+                    AgentRun.status == "running",
+                    AgentRun.lease_owner == worker_id,
+                )
+                .with_for_update()
+            )
+            if run is None:
+                raise KeyError(run_id)
+
+            step = db.scalar(
+                select(AgentStep)
+                .where(
+                    AgentStep.id == step_id,
+                    AgentStep.run_id == run_id,
+                )
+                .with_for_update()
+            )
+            if step is None:
+                raise KeyError(step_id)
+
+            self._transition_in_tx(
+                db,
+                run,
+                to_status="waiting_for_user",
+                reason=reason,
+                actor_type="worker",
+                actor_id=worker_id,
+                payload={"step_id": step_id},
+            )
+            step.status = "waiting"
+            step.ended_at = None
+
+            checkpoint_index = db.scalar(
+                select(func.max(Checkpoint.checkpoint_index)).where(
+                    Checkpoint.run_id == run_id
+                )
+            ) or 0
+            db.add(
+                Checkpoint(
+                    id=str(uuid4()),
+                    run_id=run_id,
+                    checkpoint_index=checkpoint_index + 1,
+                    state_json=checkpoint_state,
+                    created_at=datetime.now(timezone.utc),
                 )
             )
             db.flush()
