@@ -7,6 +7,7 @@ from schemas import (
     CancelRunRequest,
     CreateRunRequest,
     ResumeRunRequest,
+    RerunRunRequest,
     RunResponse,
 )
 from state_machine import InvalidRunTransition
@@ -62,6 +63,7 @@ class RunService:
             run_id=run["id"],
             org_id=run["org_id"],
             user_id=run["user_id"],
+            parent_run_id=run.get("parent_run_id"),
             run_type=run["run_type"],
             status=run["status"],
             input=run["input"],
@@ -198,6 +200,65 @@ class RunService:
         except InvalidRunTransition as exc:
             raise ServiceError(409, "INVALID_RUN_TRANSITION", str(exc))
         return self._to_response(updated_run)
+
+    def rerun_run(
+        self,
+        run_id: str,
+        org_id: str,
+        user_id: str,
+        request: RerunRunRequest,
+    ) -> RunResponse:
+        source = self._get_authorized_run(run_id, org_id)
+        if source["status"] not in {"succeeded", "failed", "cancelled"}:
+            raise ServiceError(
+                409,
+                "RERUN_REQUIRES_TERMINAL_RUN",
+                "Only a terminal run can be rerun",
+            )
+
+        now = self._now()
+        new_run_id = str(uuid4())
+        new_input = request.input if request.input is not None else source["input"]
+        new_run = {
+            "id": new_run_id,
+            "parent_run_id": source["id"],
+            "org_id": org_id,
+            "user_id": user_id,
+            "run_type": source["run_type"],
+            "idempotency_key": request.idempotency_key,
+            "input": new_input,
+            "input_hash": self._input_hash(new_input),
+            "status": "queued",
+            "output": None,
+            "error": None,
+            "created_at": now,
+            "updated_at": now,
+            "rerun_reason": request.reason,
+        }
+        event = self._event(
+            new_run_id,
+            "run.created",
+            {
+                "status": "queued",
+                "run_type": source["run_type"],
+                "parent_run_id": source["id"],
+                "rerun_reason": request.reason,
+            },
+        )
+        event["sequence"] = 1
+        stored, created = self.repository.create_if_absent(
+            org_id,
+            new_run,
+            event,
+        )
+        if not created:
+            if stored.get("parent_run_id") != source["id"]:
+                raise ServiceError(
+                    409,
+                    "IDEMPOTENCY_CONFLICT",
+                    "Idempotency key already belongs to another run",
+                )
+        return self._to_response(stored)
 
     def get_trace(self, run_id: str, org_id: str) -> dict[str, Any]:
         trace = self.repository.get_trace(run_id, org_id)

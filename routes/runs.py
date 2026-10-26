@@ -4,6 +4,7 @@ from schemas import (
     CancelRunRequest,
     CreateRunRequest,
     ResumeRunRequest,
+    RerunRunRequest,
     RunEventRecord,
     RunResponse,
     TraceResponse,
@@ -73,6 +74,16 @@ def resume_run(
 ) -> RunResponse:
     org_id, user_id = headers
     return run_service.resume_run(run_id, org_id, user_id, body)
+
+
+@router.post("/{run_id}/rerun", response_model=RunResponse, status_code=201)
+def rerun_run(
+    run_id: str,
+    body: RerunRunRequest,
+    headers: tuple[str, str] = Depends(_headers),
+) -> RunResponse:
+    org_id, user_id = headers
+    return run_service.rerun_run(run_id, org_id, user_id, body)
 
 
 @router.get("/{run_id}/trace", response_model=TraceResponse)

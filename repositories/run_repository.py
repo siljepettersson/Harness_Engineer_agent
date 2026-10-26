@@ -101,6 +101,7 @@ class SqlAlchemyRunRepository:
     def _run_to_dict(run: AgentRun) -> dict[str, Any]:
         return {
             "id": run.id,
+            "parent_run_id": run.parent_run_id,
             "org_id": run.org_id,
             "user_id": run.user_id,
             "run_type": run.run_type,
@@ -122,6 +123,7 @@ class SqlAlchemyRunRepository:
                 else None
             ),
             "attempts": run.attempts,
+            "rerun_reason": run.rerun_reason,
         }
 
     @staticmethod
@@ -261,6 +263,7 @@ class SqlAlchemyRunRepository:
             updated_at = self._datetime(run["updated_at"])
             db_run = AgentRun(
                 id=run["id"],
+                parent_run_id=run.get("parent_run_id"),
                 org_id=org_id,
                 user_id=run["user_id"],
                 run_type=run["run_type"],
@@ -271,6 +274,7 @@ class SqlAlchemyRunRepository:
                 error_json=run.get("error"),
                 created_at=created_at,
                 updated_at=updated_at,
+                rerun_reason=run.get("rerun_reason"),
             )
             db_event = RunEvent(
                 id=first_event["id"],
@@ -749,6 +753,73 @@ class SqlAlchemyRunRepository:
                 },
             )
             return True
+
+    def schedule_retry(
+        self,
+        run_id: str,
+        worker_id: str,
+        error: dict[str, Any],
+        max_attempts: int = 3,
+        backoff_seconds: int = 2,
+    ) -> dict[str, Any]:
+        """Retry a transient failure before terminalizing the run."""
+        now = datetime.now(timezone.utc)
+        with SessionLocal.begin() as db:
+            run = db.scalar(
+                select(AgentRun)
+                .where(
+                    AgentRun.id == run_id,
+                    AgentRun.status == "running",
+                    AgentRun.lease_owner == worker_id,
+                )
+                .with_for_update()
+            )
+            if run is None:
+                raise KeyError(run_id)
+
+            if run.attempts >= max_attempts:
+                self._transition_in_tx(
+                    db,
+                    run,
+                    to_status="failed",
+                    reason="retry_limit_exhausted",
+                    actor_type="worker",
+                    actor_id=worker_id,
+                    payload={"attempts": run.attempts, "max_attempts": max_attempts},
+                    error=error,
+                )
+                return self._run_to_dict(run)
+
+            next_attempt_at = now + timedelta(seconds=backoff_seconds)
+            self._transition_in_tx(
+                db,
+                run,
+                to_status="queued",
+                reason="transient_error",
+                actor_type="worker",
+                actor_id=worker_id,
+                payload={
+                    "error": error,
+                    "attempts": run.attempts,
+                    "max_attempts": max_attempts,
+                    "next_attempt_at": next_attempt_at.isoformat(),
+                },
+                error=error,
+            )
+            db.add(
+                OutboxJob(
+                    id=str(uuid4()),
+                    job_type="execute_run",
+                    payload_json={"run_id": run.id},
+                    status="pending",
+                    attempts=0,
+                    max_attempts=10,
+                    next_attempt_at=next_attempt_at,
+                    created_at=now,
+                )
+            )
+            db.flush()
+            return self._run_to_dict(run)
 
     def record_dead_letter(
         self,

@@ -58,10 +58,12 @@ def init_db() -> None:
         column["name"] for column in inspect(engine).get_columns("agent_runs")
     }
     additions = {
+        "parent_run_id": "VARCHAR(100)",
         "lease_owner": "VARCHAR(200)",
         "lease_expires_at": "DATETIME",
         "cancel_requested_at": "DATETIME",
         "attempts": "INTEGER NOT NULL DEFAULT 0",
+        "rerun_reason": "VARCHAR(200)",
     }
     missing = additions.keys() - existing_columns
     if missing:

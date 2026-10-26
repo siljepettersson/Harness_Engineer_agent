@@ -33,10 +33,17 @@ class ResumeRunRequest(StrictModel):
     input: dict[str, Any] = Field(default_factory=dict)
 
 
+class RerunRunRequest(StrictModel):
+    idempotency_key: str = Field(min_length=8, max_length=200)
+    reason: str = Field(min_length=1, max_length=200)
+    input: dict[str, Any] | None = None
+
+
 class RunResponse(BaseModel):
     run_id: str
     org_id: str
     user_id: str
+    parent_run_id: str | None = None
     run_type: str
     status: RunStatus
     input: dict[str, Any]

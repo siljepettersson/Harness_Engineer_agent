@@ -4,9 +4,14 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import select, update
 
-from database import SessionLocal
+from database import SessionLocal, init_db
 from models import AgentRun, AgentStep, AuditLog, Checkpoint, OutboxJob, RunEvent
 from repositories.run_repository import run_repository
+from schemas import RerunRunRequest
+from services.run_service import run_service
+
+
+init_db()
 from state_machine import (
     ALLOWED_RUN_TRANSITIONS,
     InvalidRunTransition,
@@ -308,3 +313,51 @@ def test_wait_for_user_persists_step_checkpoint_and_resume_atomically():
     assert step is not None
     assert step.status == "pending"
     assert jobs
+
+
+def test_retry_reuses_run_until_the_attempt_limit_then_fails():
+    run_id = _create_test_run()
+    assert run_repository.claim_run(run_id, "worker-retry") is not None
+
+    queued = run_repository.schedule_retry(
+        run_id,
+        "worker-retry",
+        {"code": "TRANSIENT_ERROR"},
+        max_attempts=3,
+        backoff_seconds=30,
+    )
+    assert queued["status"] == "queued"
+    assert run_repository.get(run_id, "state-machine-tests")["attempts"] == 1
+
+    assert run_repository.claim_run(run_id, "worker-retry-2") is not None
+    failed = run_repository.schedule_retry(
+        run_id,
+        "worker-retry-2",
+        {"code": "TRANSIENT_ERROR"},
+        max_attempts=2,
+    )
+    assert failed["status"] == "failed"
+
+
+def test_rerun_creates_a_new_run_with_parent_reference():
+    run_id = _create_test_run()
+    assert run_repository.claim_run(run_id, "worker-rerun") is not None
+    assert run_repository.finish_run(
+        run_id,
+        "worker-rerun",
+        "succeeded",
+        output={"answer": "original"},
+    )
+
+    rerun = run_service.rerun_run(
+        run_id=run_id,
+        org_id="state-machine-tests",
+        user_id="user-test",
+        request=RerunRunRequest(
+            idempotency_key=f"rerun:{uuid4()}",
+            reason="new_strategy",
+        ),
+    )
+    assert rerun.run_id != run_id
+    assert rerun.parent_run_id == run_id
+    assert rerun.status == "queued"

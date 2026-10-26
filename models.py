@@ -15,6 +15,9 @@ class AgentRun(Base):
     )
 
     id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    parent_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agent_runs.id"), index=True
+    )
     org_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     user_id: Mapped[str] = mapped_column(String(100), nullable=False)
     run_type: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -31,6 +34,7 @@ class AgentRun(Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    rerun_reason: Mapped[str | None] = mapped_column(String(200))
 
 
 class OutboxJob(Base):
