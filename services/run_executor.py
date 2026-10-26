@@ -4,6 +4,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from repositories.run_repository import SqlAlchemyRunRepository, run_repository
+from services.run_errors import RetryableRunError
 
 
 class ModelProvider(Protocol):
@@ -170,6 +171,8 @@ class RunExecutor:
 
             raise RuntimeError("Maximum agent step count exceeded")
         except Exception as exc:
+            if isinstance(exc, RetryableRunError):
+                raise
             self.repository.finish_run(
                 run_id,
                 worker_id,

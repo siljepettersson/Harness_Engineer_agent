@@ -1,4 +1,5 @@
 import unittest
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 from datetime import datetime, timedelta, timezone
@@ -143,12 +144,30 @@ class RunApiTest(unittest.TestCase):
         )
         self.assertEqual(running_resume.status_code, 409)
 
+        step_id = str(uuid4())
+        now = datetime.now(timezone.utc)
         with SessionLocal.begin() as db:
-            db.execute(
-                update(AgentRun)
-                .where(AgentRun.id == run_id)
-                .values(status="waiting_for_user")
+            db.add(
+                AgentStep(
+                    id=step_id,
+                    run_id=run_id,
+                    step_index=1,
+                    step_type="agent_loop",
+                    name="approval",
+                    status="pending",
+                    input_json={},
+                    started_at=now,
+                )
             )
+        self.assertIsNotNone(run_repository.claim_run(run_id, "worker-resume"))
+        run_repository.wait_for_user(
+            run_id=run_id,
+            org_id="org_1",
+            worker_id="worker-resume",
+            step_id=step_id,
+            checkpoint_state={"waiting": True},
+            reason="approval_required",
+        )
         waiting_resume = self.client.post(
             f"/runs/{run_id}/resume",
             json={
@@ -245,6 +264,43 @@ class RunApiTest(unittest.TestCase):
             dead_letters = db.query(DeadLetterJob).all()
             self.assertEqual(len(dead_letters), 1)
             self.assertEqual(dead_letters[0].attempts, 3)
+
+    def test_rerun_creates_new_run_only_after_terminal_state(self) -> None:
+        created = self.client.post("/runs", json=self.payload, headers=self.headers)
+        run_id = created.json()["run_id"]
+
+        rejected = self.client.post(
+            f"/runs/{run_id}/rerun",
+            json={
+                "idempotency_key": "ticket:T-9527:rerun:v1",
+                "reason": "not_ready",
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(rejected.status_code, 409)
+
+        self.assertIsNotNone(run_repository.claim_run(run_id, "worker-rerun-api"))
+        self.assertTrue(
+            run_repository.finish_run(
+                run_id,
+                "worker-rerun-api",
+                "succeeded",
+                output={"answer": "original"},
+            )
+        )
+
+        rerun = self.client.post(
+            f"/runs/{run_id}/rerun",
+            json={
+                "idempotency_key": "ticket:T-9527:rerun:v1",
+                "reason": "new_strategy",
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(rerun.status_code, 201)
+        self.assertNotEqual(rerun.json()["run_id"], run_id)
+        self.assertEqual(rerun.json()["parent_run_id"], run_id)
+        self.assertEqual(rerun.json()["status"], "queued")
 
 
 if __name__ == "__main__":

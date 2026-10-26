@@ -8,6 +8,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from database import init_db
 from routes.runs import router as runs_router
 from services.run_service import ServiceError
+from state_machine import UnauthorizedRunActor
 
 
 app = FastAPI(title="Agent Harness API", version="1.0.0")
@@ -54,6 +55,14 @@ async def service_error_handler(
     exc: ServiceError,
 ) -> JSONResponse:
     return _error(request, exc.status_code, exc.code, exc.message)
+
+
+@app.exception_handler(UnauthorizedRunActor)
+async def unauthorized_run_actor_handler(
+    request: Request,
+    exc: UnauthorizedRunActor,
+) -> JSONResponse:
+    return _error(request, 403, "FORBIDDEN_RUN_TRANSITION", str(exc))
 
 
 @app.exception_handler(RequestValidationError)

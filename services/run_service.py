@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from repositories.run_repository import RunRepository, run_repository
+from repositories.run_repository import SqlAlchemyRunRepository, run_repository
 from schemas import (
     CancelRunRequest,
     CreateRunRequest,
@@ -22,7 +22,7 @@ class ServiceError(Exception):
 
 
 class RunService:
-    def __init__(self, repository: RunRepository) -> None:
+    def __init__(self, repository: SqlAlchemyRunRepository) -> None:
         self.repository = repository
 
     @staticmethod

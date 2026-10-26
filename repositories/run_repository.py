@@ -1,10 +1,8 @@
-from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from threading import RLock
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import func, select
 
 from database import SessionLocal
 from models import (
@@ -26,68 +24,6 @@ from state_machine import (
     apply_status_fields,
     event_type_for_transition,
 )
-
-
-# Kapittel 1 bruker minne som en enkel databaseimitasjon.
-runs: dict[str, dict[str, Any]] = {}
-events_by_run_id: dict[str, list[dict[str, Any]]] = {}
-idempotency_index: dict[str, str] = {}
-
-
-class RunRepository:
-    def __init__(self) -> None:
-        self._lock = RLock()
-
-    def create_if_absent(
-        self,
-        idempotency_scope: str,
-        run: dict[str, Any],
-        first_event: dict[str, Any],
-    ) -> tuple[dict[str, Any], bool]:
-        """Atomically create a run or return the existing idempotent run."""
-        with self._lock:
-            existing_id = idempotency_index.get(idempotency_scope)
-            if existing_id is not None and existing_id in runs:
-                return deepcopy(runs[existing_id]), False
-
-            runs[run["id"]] = deepcopy(run)
-            events_by_run_id[run["id"]] = [deepcopy(first_event)]
-            idempotency_index[idempotency_scope] = run["id"]
-            return deepcopy(run), True
-
-    def get(self, run_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            run = runs.get(run_id)
-            return deepcopy(run) if run is not None else None
-
-    def list_events(self, run_id: str) -> list[dict[str, Any]]:
-        with self._lock:
-            return deepcopy(events_by_run_id.get(run_id, []))
-
-    def transition_and_append_event(
-        self,
-        run_id: str,
-        status: str,
-        updated_at: str,
-        event: dict[str, Any],
-        expected_status: str | None = None,
-    ) -> tuple[dict[str, Any] | None, bool]:
-        """Change status and append an event atomically."""
-        with self._lock:
-            run = runs.get(run_id)
-            if run is None:
-                return None, False
-
-            if expected_status is not None and run["status"] != expected_status:
-                return deepcopy(run), False
-
-            event_list = events_by_run_id.setdefault(run_id, [])
-            stored_event = deepcopy(event)
-            stored_event["sequence"] = len(event_list) + 1
-            run["status"] = status
-            run["updated_at"] = updated_at
-            event_list.append(stored_event)
-            return deepcopy(run), True
 
 
 class SqlAlchemyRunRepository:
@@ -863,32 +799,6 @@ class SqlAlchemyRunRepository:
                 .order_by(RunEvent.sequence.asc())
             ).all()
             return [self._event_to_dict(event) for event in events]
-
-    def transition_and_append_event(
-        self,
-        run_id: str,
-        org_id: str,
-        status: str,
-        updated_at: str,
-        event: dict[str, Any],
-        expected_status: str | None = None,
-    ) -> tuple[dict[str, Any] | None, bool]:
-        """Compatibility wrapper; new code must use ``transition_run``."""
-        payload = event.get("payload", {})
-        try:
-            updated = self.transition_run(
-                run_id=run_id,
-                org_id=org_id,
-                to_status=status,
-                reason=payload.get("reason", "legacy_transition"),
-                actor_type=payload.get("actor_type", "system"),
-                actor_id=payload.get("actor_id", "legacy"),
-                payload=payload,
-                expected_status=expected_status,
-            )
-        except (KeyError, InvalidRunTransition):
-            return None, False
-        return updated, True
 
     def create_step(self, org_id: str, step: dict[str, Any]) -> dict[str, Any]:
         with SessionLocal.begin() as db:
