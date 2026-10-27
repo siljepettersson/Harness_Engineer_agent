@@ -1,3 +1,5 @@
+import pytest
+
 from services.run_executor import ModelDecision, RunExecutor
 from services.run_errors import (
     ApprovalRequired,
@@ -8,6 +10,7 @@ from services.run_errors import (
     TransientRunError,
 )
 from services.fake_model import ScriptedModelProvider
+from services.tool_runtime import ToolDefinition, ToolRegistry, ToolRuntime
 
 
 class CheckpointRepository:
@@ -177,3 +180,74 @@ def test_scripted_model_provider_returns_responses_without_tool_registry_knowled
 
     assert response.final_answer == {"answer": "done"}
     assert provider.contexts == [context]
+
+
+def test_tool_registry_resolves_tools_and_rejects_unknown_names():
+    registry = ToolRegistry(
+        [
+            ToolDefinition(
+                name="get_order",
+                handler=lambda arguments, key: {
+                    "order_id": arguments["order_id"],
+                    "key": key,
+                },
+            )
+        ]
+    )
+
+    assert registry.get("get_order").name == "get_order"
+
+    with pytest.raises(PermanentRunError, match="Unknown tool"):
+        registry.get("refund_order")
+
+
+def test_tool_runtime_passes_idempotency_key_to_handler():
+    received = {}
+
+    def handler(arguments, idempotency_key):
+        received.update(
+            arguments=arguments,
+            idempotency_key=idempotency_key,
+        )
+        return {"status": "ok"}
+
+    tool = ToolDefinition(name="refund_order", handler=handler)
+    result = ToolRuntime().execute(
+        tool=tool,
+        arguments={"order_id": "ORD-10086", "amount": 39.9},
+        idempotency_key="refund:ORD-10086:T-9527:v1",
+    )
+
+    assert result == {"status": "ok"}
+    assert received["idempotency_key"] == "refund:ORD-10086:T-9527:v1"
+
+
+def test_tool_runtime_classifies_validation_and_network_errors():
+    def validate(arguments):
+        if arguments.get("amount", 0) <= 0:
+            raise ValueError("amount must be positive")
+
+    invalid_tool = ToolDefinition(
+        name="refund_order",
+        handler=lambda arguments, key: {"status": "ok"},
+        validate_arguments=validate,
+    )
+
+    with pytest.raises(PermanentRunError, match="Invalid arguments"):
+        ToolRuntime().execute(
+            tool=invalid_tool,
+            arguments={"amount": 0},
+        )
+
+    unavailable_tool = ToolDefinition(
+        name="get_order",
+        handler=lambda arguments, key: (_ for _ in ()).throw(
+            ConnectionError("downstream unavailable")
+        ),
+    )
+
+    with pytest.raises(TransientRunError, match="Transient failure"):
+        ToolRuntime().execute(
+            tool=unavailable_tool,
+            arguments={},
+        )
