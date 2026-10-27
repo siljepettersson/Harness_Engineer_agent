@@ -19,6 +19,7 @@ class CheckpointRepository:
         self.saved = []
         self.steps = []
         self.model_calls = []
+        self.tool_calls = []
         self.events = []
 
     def get_latest_checkpoint(self, *, run_id, org_id):
@@ -44,6 +45,10 @@ class CheckpointRepository:
 
     def record_model_call(self, org_id, call):
         self.model_calls.append(call)
+        return call
+
+    def record_tool_call(self, org_id, call):
+        self.tool_calls.append(call)
         return call
 
     def append_event(self, org_id, run_id, event_type, payload=None):
@@ -345,4 +350,59 @@ def test_run_model_step_records_failure_before_reraising():
         "model.started",
         "model.failed",
         "step.failed",
+    ]
+
+
+def test_run_tool_round_records_tool_step_call_and_events():
+    repository = CheckpointRepository()
+    executor = RunExecutor(repository)
+    tool = ToolDefinition(
+        name="refund_order",
+        handler=lambda arguments, key: {
+            "refund_id": "RF-2201",
+            "idempotency_key": key,
+        },
+        idempotency_key=lambda run, arguments:
+            f"refund:{arguments['order_id']}:{run['input']['ticket_id']}:v1",
+    )
+    decision = ModelDecision(
+        provider="fake",
+        model="fake-model",
+        response_json={
+            "tool_use": {
+                "id": "tc_refund_1",
+                "name": "refund_order",
+            }
+        },
+        tool_name="refund_order",
+        tool_arguments={
+            "order_id": "ORD-10086",
+            "amount": 39.9,
+        },
+        tool_use_id="tc_refund_1",
+    )
+
+    result = executor.run_tool_round(
+        run={
+            "id": "run-123",
+            "org_id": "org-1",
+            "run_type": "support_ticket",
+            "input": {"ticket_id": "T-9527"},
+        },
+        tool=tool,
+        decision=decision,
+        step_index=2,
+    )
+
+    assert result["refund_id"] == "RF-2201"
+    assert repository.steps[0]["step_type"] == "tool"
+    assert repository.steps[0]["name"] == "refund_order"
+    assert repository.tool_calls[0]["idempotency_key"] == (
+        "refund:ORD-10086:T-9527:v1"
+    )
+    assert repository.events == [
+        "step.started",
+        "tool.started",
+        "tool.completed",
+        "step.completed",
     ]

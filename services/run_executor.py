@@ -4,7 +4,8 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from repositories.run_repository import SqlAlchemyRunRepository, run_repository
-from services.run_errors import RetryableRunError
+from services.run_errors import PermanentRunError, RetryableRunError
+from services.tool_runtime import ToolDefinition, ToolRegistry, ToolRuntime
 
 
 class ModelProvider(Protocol):
@@ -13,16 +14,6 @@ class ModelProvider(Protocol):
         *,
         context: dict[str, Any],
     ) -> "ModelDecision": ...
-
-
-class ToolRegistry(Protocol):
-    def call(
-        self,
-        *,
-        name: str,
-        arguments: dict[str, Any],
-        idempotency_key: str,
-    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -51,11 +42,13 @@ class RunExecutor:
         repository: SqlAlchemyRunRepository,
         model_provider: ModelProvider | None = None,
         tool_registry: ToolRegistry | None = None,
+        tool_runtime: ToolRuntime | None = None,
         max_steps: int = 20,
     ) -> None:
         self.repository = repository
         self.model_provider = model_provider
         self.tool_registry = tool_registry
+        self.tool_runtime = tool_runtime or ToolRuntime()
         self.max_steps = max_steps
 
     def execute(self, run_id: str, worker_id: str) -> dict[str, Any]:
@@ -71,14 +64,14 @@ class RunExecutor:
         context = self._load_context(run)
 
         try:
-            for step_index in range(1, self.max_steps + 1):
+            for loop_index in range(1, self.max_steps + 1):
                 if self.repository.cancel_if_requested(run_id, worker_id):
                     return {"run_id": run_id, "status": "cancelled"}
 
                 decision = self.run_model_step(
                     run=run,
                     context=context,
-                    step_index=step_index,
+                    step_index=(loop_index * 2) - 1,
                 )
                 context["messages"].append(
                     self._assistant_message(decision)
@@ -102,30 +95,12 @@ class RunExecutor:
                 if self.repository.cancel_if_requested(run_id, worker_id):
                     return {"run_id": run_id, "status": "cancelled"}
 
-                idempotency_key = self._tool_idempotency_key(
-                    run,
-                    decision.tool_name,
-                    decision.tool_arguments,
-                )
-                result = self.tool_registry.call(
-                    name=decision.tool_name,
-                    arguments=decision.tool_arguments,
-                    idempotency_key=idempotency_key,
-                )
-                self.repository.record_tool_call(
-                    run["org_id"],
-                    {
-                        "id": str(uuid4()),
-                        "run_id": run_id,
-                        "step_id": step_id,
-                        "tool_name": decision.tool_name,
-                        "args_json": decision.tool_arguments,
-                        "result_json": result,
-                        "status": "succeeded",
-                        "idempotency_key": idempotency_key,
-                        "created_at": started_at,
-                        "ended_at": self._now(),
-                    },
+                tool = self.tool_registry.get(decision.tool_name)
+                result = self.run_tool_round(
+                    run=run,
+                    tool=tool,
+                    decision=decision,
+                    step_index=loop_index * 2,
                 )
                 context["messages"].append(
                     {
@@ -275,6 +250,132 @@ class RunExecutor:
             )
             raise
 
+    def run_tool_round(
+        self,
+        run: dict[str, Any],
+        tool: ToolDefinition,
+        decision: ModelDecision,
+        step_index: int,
+    ) -> dict[str, Any]:
+        if decision.tool_name is None or decision.tool_arguments is None:
+            raise PermanentRunError("tool_decision_missing_arguments")
+
+        step_id = str(uuid4())
+        started_at = self._now()
+        arguments = decision.tool_arguments
+        idempotency_key = self._tool_idempotency_key(
+            run,
+            tool,
+            arguments,
+            decision.tool_use_id,
+        )
+
+        self.repository.create_step(
+            run["org_id"],
+            {
+                "id": step_id,
+                "run_id": run["id"],
+                "step_index": step_index,
+                "step_type": "tool",
+                "name": tool.name,
+                "status": "running",
+                "input_json": arguments,
+                "started_at": started_at,
+            },
+        )
+        self.repository.append_event(
+            run["org_id"],
+            run["id"],
+            "step.started",
+            {"step_id": step_id, "step_type": "tool", "name": tool.name},
+        )
+        self.repository.append_event(
+            run["org_id"],
+            run["id"],
+            "tool.started",
+            {"step_id": step_id, "tool_name": tool.name},
+        )
+
+        try:
+            result = self.tool_runtime.execute(
+                tool=tool,
+                arguments=arguments,
+                idempotency_key=idempotency_key,
+            )
+            self.repository.record_tool_call(
+                run["org_id"],
+                {
+                    "id": str(uuid4()),
+                    "run_id": run["id"],
+                    "step_id": step_id,
+                    "tool_name": tool.name,
+                    "args_json": arguments,
+                    "result_json": result,
+                    "status": "succeeded",
+                    "idempotency_key": idempotency_key,
+                    "created_at": started_at,
+                    "ended_at": self._now(),
+                },
+            )
+            self.repository.update_step(
+                run["org_id"],
+                step_id,
+                "succeeded",
+                output_json=result,
+            )
+            self.repository.append_event(
+                run["org_id"],
+                run["id"],
+                "tool.completed",
+                {"step_id": step_id, "tool_name": tool.name},
+            )
+            self.repository.append_event(
+                run["org_id"],
+                run["id"],
+                "step.completed",
+                {"step_id": step_id, "step_type": "tool"},
+            )
+            return result
+        except Exception as exc:
+            error = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+            self.repository.record_tool_call(
+                run["org_id"],
+                {
+                    "id": str(uuid4()),
+                    "run_id": run["id"],
+                    "step_id": step_id,
+                    "tool_name": tool.name,
+                    "args_json": arguments,
+                    "status": "failed",
+                    "idempotency_key": idempotency_key,
+                    "error_json": error,
+                    "created_at": started_at,
+                    "ended_at": self._now(),
+                },
+            )
+            self.repository.update_step(
+                run["org_id"],
+                step_id,
+                "failed",
+                error_json=error,
+            )
+            self.repository.append_event(
+                run["org_id"],
+                run["id"],
+                "tool.failed",
+                {"step_id": step_id, "tool_name": tool.name, "error": error},
+            )
+            self.repository.append_event(
+                run["org_id"],
+                run["id"],
+                "step.failed",
+                {"step_id": step_id, "step_type": "tool", "error": error},
+            )
+            raise
+
     @staticmethod
     def _initial_context(run: dict[str, Any]) -> dict[str, Any]:
         """Build the canonical message-list context for a new run."""
@@ -334,11 +435,13 @@ class RunExecutor:
     @staticmethod
     def _tool_idempotency_key(
         run: dict[str, Any],
-        tool_name: str,
+        tool: ToolDefinition,
         arguments: dict[str, Any],
+        tool_use_id: str | None,
     ) -> str:
-        business_key = run["input"].get("ticket_id", run["id"])
-        return f"{tool_name}:{business_key}:{run['run_type']}"
+        if tool.idempotency_key is not None:
+            return tool.idempotency_key(run, arguments)
+        return f"{tool.name}:{run['id']}:{tool_use_id or 'unknown'}"
 
 
 run_executor = RunExecutor(run_repository)
