@@ -17,6 +17,9 @@ class CheckpointRepository:
     def __init__(self, checkpoint=None):
         self.checkpoint = checkpoint
         self.saved = []
+        self.steps = []
+        self.model_calls = []
+        self.events = []
 
     def get_latest_checkpoint(self, *, run_id, org_id):
         return self.checkpoint
@@ -26,6 +29,30 @@ class CheckpointRepository:
 
     def save_checkpoint(self, org_id, checkpoint):
         self.saved.append((org_id, checkpoint))
+
+    def create_step(self, org_id, step):
+        self.steps.append(step)
+        return step
+
+    def update_step(self, org_id, step_id, status, output_json=None, error_json=None):
+        return {
+            "id": step_id,
+            "status": status,
+            "output_json": output_json,
+            "error_json": error_json,
+        }
+
+    def record_model_call(self, org_id, call):
+        self.model_calls.append(call)
+        return call
+
+    def append_event(self, org_id, run_id, event_type, payload=None):
+        self.events.append(event_type)
+        return {
+            "run_id": run_id,
+            "event_type": event_type,
+            "payload": payload or {},
+        }
 
 
 def test_new_run_context_uses_canonical_message_list():
@@ -251,3 +278,71 @@ def test_tool_runtime_classifies_validation_and_network_errors():
             tool=unavailable_tool,
             arguments={},
         )
+
+
+def test_run_model_step_records_model_step_call_and_events():
+    repository = CheckpointRepository()
+    provider = ScriptedModelProvider(
+        [
+            ModelDecision(
+                provider="fake",
+                model="fake-model",
+                response_json={"text": "done"},
+                final_answer={"answer": "done"},
+                prompt_tokens=10,
+                completion_tokens=3,
+                latency_ms=25,
+            )
+        ]
+    )
+    executor = RunExecutor(repository, model_provider=provider)
+    run = {"id": "run-123", "org_id": "org-1"}
+    context = {
+        "messages": [],
+        "completed_tool_calls": [],
+        "last": "user",
+    }
+
+    response = executor.run_model_step(run, context, step_index=1)
+
+    assert response.final_answer == {"answer": "done"}
+    assert repository.steps[0]["step_type"] == "model"
+    assert repository.steps[0]["status"] == "running"
+    assert repository.model_calls[0]["status"] == "succeeded"
+    assert repository.model_calls[0]["prompt_tokens"] == 10
+    assert repository.events == [
+        "step.started",
+        "model.started",
+        "model.completed",
+        "step.completed",
+    ]
+
+
+def test_run_model_step_records_failure_before_reraising():
+    repository = CheckpointRepository()
+
+    class FailingProvider:
+        def complete(self, *, context):
+            raise TransientRunError("provider unavailable")
+
+    executor = RunExecutor(repository, model_provider=FailingProvider())
+
+    with pytest.raises(TransientRunError, match="provider unavailable"):
+        executor.run_model_step(
+            {"id": "run-123", "org_id": "org-1"},
+            {
+                "messages": [],
+                "completed_tool_calls": [],
+                "last": "user",
+            },
+            step_index=1,
+        )
+
+    assert repository.model_calls[0]["status"] == "failed"
+    assert repository.model_calls[0]["error_json"]["type"] == "TransientRunError"
+    assert repository.events == [
+        "step.started",
+        "model.started",
+        "model.failed",
+        "step.failed",
+    ]

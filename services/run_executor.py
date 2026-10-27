@@ -30,6 +30,9 @@ class ModelDecision:
     provider: str
     model: str
     response_json: dict[str, Any]
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    latency_ms: int | None = None
     tool_name: str | None = None
     tool_arguments: dict[str, Any] | None = None
     final_answer: dict[str, Any] | None = None
@@ -72,45 +75,15 @@ class RunExecutor:
                 if self.repository.cancel_if_requested(run_id, worker_id):
                     return {"run_id": run_id, "status": "cancelled"}
 
-                started_at = self._now()
-                decision = self.model_provider.complete(
+                decision = self.run_model_step(
+                    run=run,
                     context=context,
+                    step_index=step_index,
                 )
                 context["messages"].append(
                     self._assistant_message(decision)
                 )
                 context["last"] = "assistant"
-                step_id = str(uuid4())
-
-                self.repository.create_step(
-                    run["org_id"],
-                    {
-                        "id": step_id,
-                        "run_id": run_id,
-                        "step_index": step_index,
-                        "step_type": "agent_loop",
-                        "name": decision.tool_name or "final_answer",
-                        "status": "completed",
-                        "input_json": context,
-                        "output_json": decision.response_json,
-                        "started_at": started_at,
-                        "ended_at": self._now(),
-                    },
-                )
-                self.repository.record_model_call(
-                    run["org_id"],
-                    {
-                        "id": str(uuid4()),
-                        "run_id": run_id,
-                        "step_id": step_id,
-                        "provider": decision.provider,
-                        "model": decision.model,
-                        "request_json": context,
-                        "response_json": decision.response_json,
-                        "status": "succeeded",
-                        "created_at": started_at,
-                    },
-                )
 
                 if decision.tool_name is None:
                     output = decision.final_answer or decision.response_json
@@ -184,6 +157,121 @@ class RunExecutor:
                     "type": type(exc).__name__,
                     "message": str(exc),
                 },
+            )
+            raise
+
+    def run_model_step(
+        self,
+        run: dict[str, Any],
+        context: dict[str, Any],
+        step_index: int,
+    ) -> ModelDecision:
+        step_id = str(uuid4())
+        started_at = self._now()
+        request_json = context
+
+        self.repository.create_step(
+            run["org_id"],
+            {
+                "id": step_id,
+                "run_id": run["id"],
+                "step_index": step_index,
+                "step_type": "model",
+                "name": "decide_next_action",
+                "status": "running",
+                "input_json": request_json,
+                "started_at": started_at,
+            },
+        )
+        self.repository.append_event(
+            run["org_id"],
+            run["id"],
+            "step.started",
+            {"step_id": step_id, "step_type": "model"},
+        )
+        self.repository.append_event(
+            run["org_id"],
+            run["id"],
+            "model.started",
+            {"step_id": step_id},
+        )
+
+        try:
+            response = self.model_provider.complete(
+                context=context,
+            )
+            self.repository.record_model_call(
+                run["org_id"],
+                {
+                    "id": str(uuid4()),
+                    "run_id": run["id"],
+                    "step_id": step_id,
+                    "provider": response.provider,
+                    "model": response.model,
+                    "request_json": request_json,
+                    "response_json": response.response_json,
+                    "prompt_tokens": response.prompt_tokens,
+                    "completion_tokens": response.completion_tokens,
+                    "latency_ms": response.latency_ms,
+                    "status": "succeeded",
+                    "created_at": started_at,
+                },
+            )
+            self.repository.update_step(
+                run["org_id"],
+                step_id,
+                "succeeded",
+                output_json=response.response_json,
+            )
+            self.repository.append_event(
+                run["org_id"],
+                run["id"],
+                "model.completed",
+                {"step_id": step_id},
+            )
+            self.repository.append_event(
+                run["org_id"],
+                run["id"],
+                "step.completed",
+                {"step_id": step_id},
+            )
+            return response
+        except Exception as exc:
+            error = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+            self.repository.record_model_call(
+                run["org_id"],
+                {
+                    "id": str(uuid4()),
+                    "run_id": run["id"],
+                    "step_id": step_id,
+                    "provider": "unknown",
+                    "model": "unknown",
+                    "request_json": request_json,
+                    "status": "failed",
+                    "error_json": error,
+                    "created_at": started_at,
+                },
+            )
+            self.repository.update_step(
+                run["org_id"],
+                step_id,
+                "failed",
+                error_json=error,
+            )
+            self.repository.append_event(
+                run["org_id"],
+                run["id"],
+                "model.failed",
+                {"step_id": step_id, "error": error},
+            )
+            self.repository.append_event(
+                run["org_id"],
+                run["id"],
+                "step.failed",
+                {"step_id": step_id, "error": error},
             )
             raise
 

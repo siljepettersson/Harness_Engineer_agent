@@ -821,6 +821,62 @@ class SqlAlchemyRunRepository:
             db.flush()
             return self._step_to_dict(db_step)
 
+    def update_step(
+        self,
+        org_id: str,
+        step_id: str,
+        status: str,
+        output_json: dict[str, Any] | None = None,
+        error_json: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with SessionLocal.begin() as db:
+            step = db.scalar(
+                select(AgentStep)
+                .join(AgentRun, AgentRun.id == AgentStep.run_id)
+                .where(
+                    AgentStep.id == step_id,
+                    AgentRun.org_id == org_id,
+                )
+                .with_for_update()
+            )
+            if step is None:
+                raise KeyError(step_id)
+
+            step.status = status
+            step.output_json = output_json
+            step.error_json = error_json
+            step.ended_at = datetime.now(timezone.utc)
+            db.flush()
+            return self._step_to_dict(step)
+
+    def append_event(
+        self,
+        org_id: str,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with SessionLocal.begin() as db:
+            if not self._run_belongs_to_org(db, run_id, org_id):
+                raise ValueError("Run not found")
+
+            sequence = db.scalar(
+                select(func.max(RunEvent.sequence)).where(
+                    RunEvent.run_id == run_id
+                )
+            ) or 0
+            event = RunEvent(
+                id=str(uuid4()),
+                run_id=run_id,
+                sequence=sequence + 1,
+                event_type=event_type,
+                payload_json=payload or {},
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(event)
+            db.flush()
+            return self._event_to_dict(event)
+
     def record_model_call(self, org_id: str, call: dict[str, Any]) -> dict[str, Any]:
         with SessionLocal.begin() as db:
             if not self._run_belongs_to_org(db, call["run_id"], org_id):
