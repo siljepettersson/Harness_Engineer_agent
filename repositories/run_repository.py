@@ -901,6 +901,23 @@ class SqlAlchemyRunRepository:
                 return None
             return self._checkpoint_to_dict(checkpoint)
 
+    def next_checkpoint_index(
+        self,
+        run_id: str,
+        org_id: str,
+    ) -> int:
+        """Return the next monotonic checkpoint number for a run."""
+        with SessionLocal() as db:
+            if not self._run_belongs_to_org(db, run_id, org_id):
+                raise ValueError("Run not found")
+
+            current = db.scalar(
+                select(func.max(Checkpoint.checkpoint_index)).where(
+                    Checkpoint.run_id == run_id
+                )
+            )
+            return (current or 0) + 1
+
     def record_usage(self, org_id: str, usage: dict[str, Any]) -> dict[str, Any]:
         with SessionLocal.begin() as db:
             if not self._run_belongs_to_org(db, usage["run_id"], org_id):

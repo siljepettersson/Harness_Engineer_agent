@@ -173,16 +173,7 @@ class RunExecutor:
                     decision.tool_use_id
                 )
                 context["last"] = "tool_result"
-                self.repository.save_checkpoint(
-                    run["org_id"],
-                    {
-                        "id": str(uuid4()),
-                        "run_id": run_id,
-                        "checkpoint_index": step_index,
-                        "state_json": context,
-                        "created_at": self._now(),
-                    },
-                )
+                self._save_context(run, context)
 
             raise RuntimeError("Maximum agent step count exceeded")
         except Exception as exc:
@@ -221,6 +212,26 @@ class RunExecutor:
         if checkpoint is not None:
             return checkpoint["state_json"]
         return self._initial_context(run)
+
+    def _save_context(
+        self,
+        run: dict[str, Any],
+        context: dict[str, Any],
+    ) -> None:
+        checkpoint_index = self.repository.next_checkpoint_index(
+            run_id=run["id"],
+            org_id=run["org_id"],
+        )
+        self.repository.save_checkpoint(
+            run["org_id"],
+            {
+                "id": str(uuid4()),
+                "run_id": run["id"],
+                "checkpoint_index": checkpoint_index,
+                "state_json": context,
+                "created_at": self._now(),
+            },
+        )
 
     @staticmethod
     def _assistant_message(

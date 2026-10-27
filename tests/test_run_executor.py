@@ -4,9 +4,16 @@ from services.run_executor import ModelDecision, RunExecutor
 class CheckpointRepository:
     def __init__(self, checkpoint=None):
         self.checkpoint = checkpoint
+        self.saved = []
 
     def get_latest_checkpoint(self, *, run_id, org_id):
         return self.checkpoint
+
+    def next_checkpoint_index(self, *, run_id, org_id):
+        return 7
+
+    def save_checkpoint(self, org_id, checkpoint):
+        self.saved.append((org_id, checkpoint))
 
 
 def test_new_run_context_uses_canonical_message_list():
@@ -101,3 +108,25 @@ def test_context_falls_back_to_initial_input_without_checkpoint():
     ]
     assert restored["completed_tool_calls"] == []
     assert restored["last"] == "user"
+
+
+def test_save_context_uses_repository_checkpoint_sequence():
+    repository = CheckpointRepository()
+    executor = RunExecutor(repository)
+    run = {
+        "id": "run-123",
+        "org_id": "org-1",
+    }
+    context = {
+        "messages": [],
+        "completed_tool_calls": [],
+        "last": "user",
+    }
+
+    executor._save_context(run, context)
+
+    assert len(repository.saved) == 1
+    org_id, checkpoint = repository.saved[0]
+    assert org_id == "org-1"
+    assert checkpoint["checkpoint_index"] == 7
+    assert checkpoint["state_json"] == context
