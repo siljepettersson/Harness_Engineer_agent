@@ -1,4 +1,12 @@
 from services.run_executor import ModelDecision, RunExecutor
+from services.run_errors import (
+    ApprovalRequired,
+    PermanentRunError,
+    RunCancelled,
+    RunExecutionError,
+    RetryableRunError,
+    TransientRunError,
+)
 
 
 class CheckpointRepository:
@@ -130,3 +138,16 @@ def test_save_context_uses_repository_checkpoint_sequence():
     assert org_id == "org-1"
     assert checkpoint["checkpoint_index"] == 7
     assert checkpoint["state_json"] == context
+
+
+def test_run_error_protocol_has_distinct_retry_and_terminal_categories():
+    assert issubclass(TransientRunError, RunExecutionError)
+    assert issubclass(PermanentRunError, RunExecutionError)
+    assert issubclass(ApprovalRequired, RunExecutionError)
+    assert issubclass(RunCancelled, RunExecutionError)
+    assert issubclass(RetryableRunError, TransientRunError)
+
+    assert not isinstance(
+        PermanentRunError("invalid input"),
+        TransientRunError,
+    )
