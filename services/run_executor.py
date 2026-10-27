@@ -66,7 +66,7 @@ class RunExecutor:
         if run is None:
             return {"run_id": run_id, "status": "skipped"}
 
-        context = self._initial_context(run)
+        context = self._load_context(run)
         tools: list[str] = []
 
         try:
@@ -212,6 +212,15 @@ class RunExecutor:
             "completed_tool_calls": [],
             "last": "user",
         }
+
+    def _load_context(self, run: dict[str, Any]) -> dict[str, Any]:
+        checkpoint = self.repository.get_latest_checkpoint(
+            run_id=run["id"],
+            org_id=run["org_id"],
+        )
+        if checkpoint is not None:
+            return checkpoint["state_json"]
+        return self._initial_context(run)
 
     @staticmethod
     def _assistant_message(

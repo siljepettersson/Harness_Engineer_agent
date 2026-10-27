@@ -881,6 +881,26 @@ class SqlAlchemyRunRepository:
             db.flush()
             return self._checkpoint_to_dict(db_checkpoint)
 
+    def get_latest_checkpoint(
+        self,
+        run_id: str,
+        org_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the newest checkpoint for an organization-owned run."""
+        with SessionLocal() as db:
+            checkpoint = db.scalar(
+                select(Checkpoint)
+                .join(AgentRun, AgentRun.id == Checkpoint.run_id)
+                .where(
+                    Checkpoint.run_id == run_id,
+                    AgentRun.org_id == org_id,
+                )
+                .order_by(Checkpoint.checkpoint_index.desc())
+            )
+            if checkpoint is None:
+                return None
+            return self._checkpoint_to_dict(checkpoint)
+
     def record_usage(self, org_id: str, usage: dict[str, Any]) -> dict[str, Any]:
         with SessionLocal.begin() as db:
             if not self._run_belongs_to_org(db, usage["run_id"], org_id):
