@@ -34,6 +34,7 @@ class ModelDecision:
     tool_name: str | None = None
     tool_arguments: dict[str, Any] | None = None
     final_answer: dict[str, Any] | None = None
+    tool_use_id: str | None = None
 
 
 class ExecutorConfigurationError(RuntimeError):
@@ -65,7 +66,7 @@ class RunExecutor:
         if run is None:
             return {"run_id": run_id, "status": "skipped"}
 
-        context: dict[str, Any] = {"input": run["input"], "tool_results": []}
+        context = self._initial_context(run)
         tools: list[str] = []
 
         try:
@@ -78,6 +79,10 @@ class RunExecutor:
                     context=context,
                     tools=tools,
                 )
+                context["messages"].append(
+                    self._assistant_message(decision)
+                )
+                context["last"] = "assistant"
                 step_id = str(uuid4())
 
                 self.repository.create_step(
@@ -152,12 +157,22 @@ class RunExecutor:
                         "ended_at": self._now(),
                     },
                 )
-                context["tool_results"].append(
+                context["messages"].append(
                     {
-                        "tool_name": decision.tool_name,
-                        "result": result,
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": decision.tool_use_id,
+                                "content": result,
+                            }
+                        ],
                     }
                 )
+                context["completed_tool_calls"].append(
+                    decision.tool_use_id
+                )
+                context["last"] = "tool_result"
                 self.repository.save_checkpoint(
                     run["org_id"],
                     {
@@ -183,6 +198,29 @@ class RunExecutor:
                 },
             )
             raise
+
+    @staticmethod
+    def _initial_context(run: dict[str, Any]) -> dict[str, Any]:
+        """Build the canonical message-list context for a new run."""
+        return {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": run["input"],
+                }
+            ],
+            "completed_tool_calls": [],
+            "last": "user",
+        }
+
+    @staticmethod
+    def _assistant_message(
+        decision: ModelDecision,
+    ) -> dict[str, Any]:
+        return {
+            "role": "assistant",
+            "content": decision.response_json,
+        }
 
     @staticmethod
     def _now() -> str:
