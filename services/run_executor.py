@@ -12,7 +12,6 @@ class ModelProvider(Protocol):
         self,
         *,
         context: dict[str, Any],
-        tools: list[str],
     ) -> "ModelDecision": ...
 
 
@@ -67,7 +66,6 @@ class RunExecutor:
             return {"run_id": run_id, "status": "skipped"}
 
         context = self._load_context(run)
-        tools: list[str] = []
 
         try:
             for step_index in range(1, self.max_steps + 1):
@@ -77,7 +75,6 @@ class RunExecutor:
                 started_at = self._now()
                 decision = self.model_provider.complete(
                     context=context,
-                    tools=tools,
                 )
                 context["messages"].append(
                     self._assistant_message(decision)

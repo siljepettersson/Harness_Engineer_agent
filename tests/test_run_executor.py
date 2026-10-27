@@ -7,6 +7,7 @@ from services.run_errors import (
     RetryableRunError,
     TransientRunError,
 )
+from services.fake_model import ScriptedModelProvider
 
 
 class CheckpointRepository:
@@ -151,3 +152,28 @@ def test_run_error_protocol_has_distinct_retry_and_terminal_categories():
         PermanentRunError("invalid input"),
         TransientRunError,
     )
+
+
+def test_scripted_model_provider_returns_responses_without_tool_registry_knowledge():
+    provider = ScriptedModelProvider(
+        [
+            ModelDecision(
+                provider="fake",
+                model="fake-model",
+                response_json={"text": "done"},
+                final_answer={"answer": "done"},
+            )
+        ]
+    )
+    context = {
+        "messages": [
+            {"role": "user", "content": {"message": "hello"}},
+        ],
+        "completed_tool_calls": [],
+        "last": "user",
+    }
+
+    response = provider.complete(context=context)
+
+    assert response.final_answer == {"answer": "done"}
+    assert provider.contexts == [context]
