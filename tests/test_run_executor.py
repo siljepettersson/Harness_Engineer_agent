@@ -81,6 +81,26 @@ class CheckpointRepository:
         }
         return {"status": "queued"}
 
+    def wait_for_user(
+        self,
+        *,
+        run_id,
+        org_id,
+        worker_id,
+        step_id,
+        checkpoint_state,
+        reason,
+    ):
+        self.waiting = {
+            "run_id": run_id,
+            "org_id": org_id,
+            "worker_id": worker_id,
+            "step_id": step_id,
+            "checkpoint_state": checkpoint_state,
+            "reason": reason,
+        }
+        return {"status": "waiting_for_user"}
+
 
 def test_new_run_context_uses_canonical_message_list():
     context = RunExecutor._initial_context(
@@ -546,3 +566,54 @@ def test_execute_terminalizes_permanent_errors_inside_execute_run():
     assert result == {"run_id": "run-123", "status": "failed"}
     assert repository.finished["status"] == "failed"
     assert repository.finished["error"]["type"] == "PermanentRunError"
+
+
+def test_run_loop_releases_worker_when_tool_approval_is_required():
+    repository = CheckpointRepository()
+    provider = ScriptedModelProvider(
+        [
+            ModelDecision(
+                provider="fake",
+                model="fake-model",
+                response_json={"tool_use": {"name": "refund_order"}},
+                tool_name="refund_order",
+                tool_arguments={"order_id": "ORD-10086", "amount": 39.9},
+                tool_use_id="tc_refund_1",
+            )
+        ]
+    )
+    registry = ToolRegistry(
+        [
+            ToolDefinition(
+                name="refund_order",
+                handler=lambda arguments, key: {"refund_id": "RF-2201"},
+                requires_approval=True,
+            )
+        ]
+    )
+    executor = RunExecutor(
+        repository,
+        model_provider=provider,
+        tool_registry=registry,
+    )
+
+    result = executor.run_loop(
+        run={
+            "id": "run-123",
+            "org_id": "org-1",
+            "run_type": "support_ticket",
+            "input": {"ticket_id": "T-9527"},
+        },
+        context=RunExecutor._initial_context(
+            {"input": {"ticket_id": "T-9527"}}
+        ),
+        worker_id="worker-1",
+    )
+
+    assert result == {
+        "run_id": "run-123",
+        "status": "waiting_for_user",
+    }
+    assert repository.waiting["reason"] == "tool_approval_required"
+    assert repository.waiting["checkpoint_state"]["last"] == "assistant"
+    assert not repository.tool_calls

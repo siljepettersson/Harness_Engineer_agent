@@ -139,6 +139,20 @@ class RunExecutor:
                 return {"run_id": run["id"], "status": "cancelled"}
 
             tool = self.tool_registry.get(decision.tool_name)
+            if (
+                tool.requires_approval
+                and not self._approval_granted(run, decision)
+            ):
+                self._pause_for_approval(
+                    run=run,
+                    context=context,
+                    tool=tool,
+                    decision=decision,
+                    step_index=loop_index * 2,
+                    worker_id=worker_id,
+                )
+                return {"run_id": run["id"], "status": "waiting_for_user"}
+
             result = self.run_tool_round(
                 run=run,
                 tool=tool,
@@ -164,6 +178,62 @@ class RunExecutor:
             self._save_context(run, context)
 
         raise PermanentRunError("max_loop_steps_exceeded")
+
+    @staticmethod
+    def _approval_granted(
+        run: dict[str, Any],
+        decision: ModelDecision,
+    ) -> bool:
+        approved_ids = run.get("approved_tool_use_ids", [])
+        if not approved_ids:
+            approved_ids = run.get("input", {}).get(
+                "approved_tool_use_ids",
+                [],
+            )
+        return decision.tool_use_id in approved_ids
+
+    def _pause_for_approval(
+        self,
+        *,
+        run: dict[str, Any],
+        context: dict[str, Any],
+        tool: ToolDefinition,
+        decision: ModelDecision,
+        step_index: int,
+        worker_id: str,
+    ) -> None:
+        step_id = str(uuid4())
+        self.repository.create_step(
+            run["org_id"],
+            {
+                "id": step_id,
+                "run_id": run["id"],
+                "step_index": step_index,
+                "step_type": "tool",
+                "name": tool.name,
+                "status": "pending",
+                "input_json": decision.tool_arguments or {},
+                "started_at": self._now(),
+            },
+        )
+        self.repository.append_event(
+            run["org_id"],
+            run["id"],
+            "tool.waiting_for_user",
+            {
+                "step_id": step_id,
+                "tool_name": tool.name,
+                "tool_use_id": decision.tool_use_id,
+            },
+        )
+        self.repository.wait_for_user(
+            run_id=run["id"],
+            org_id=run["org_id"],
+            worker_id=worker_id,
+            step_id=step_id,
+            checkpoint_state=deepcopy(context),
+            reason="tool_approval_required",
+        )
 
     def run_model_step(
         self,
