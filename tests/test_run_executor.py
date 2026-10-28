@@ -21,6 +21,7 @@ class CheckpointRepository:
         self.model_calls = []
         self.tool_calls = []
         self.events = []
+        self.finished = None
 
     def get_latest_checkpoint(self, *, run_id, org_id):
         return self.checkpoint
@@ -58,6 +59,19 @@ class CheckpointRepository:
             "event_type": event_type,
             "payload": payload or {},
         }
+
+    def cancel_if_requested(self, run_id, worker_id):
+        return False
+
+    def finish_run(self, run_id, worker_id, status, output=None, error=None):
+        self.finished = {
+            "run_id": run_id,
+            "worker_id": worker_id,
+            "status": status,
+            "output": output,
+            "error": error,
+        }
+        return True
 
 
 def test_new_run_context_uses_canonical_message_list():
@@ -406,3 +420,58 @@ def test_run_tool_round_records_tool_step_call_and_events():
         "tool.completed",
         "step.completed",
     ]
+
+
+def test_run_loop_checkpoints_model_output_and_tool_result():
+    repository = CheckpointRepository()
+    provider = ScriptedModelProvider(
+        [
+            ModelDecision(
+                provider="fake",
+                model="fake-model",
+                response_json={"tool_use": {"name": "get_order"}},
+                tool_name="get_order",
+                tool_arguments={"order_id": "ORD-10086"},
+                tool_use_id="tc_get_order_1",
+            ),
+            ModelDecision(
+                provider="fake",
+                model="fake-model",
+                response_json={"text": "done"},
+                final_answer={"answer": "done"},
+            ),
+        ]
+    )
+    registry = ToolRegistry(
+        [
+            ToolDefinition(
+                name="get_order",
+                handler=lambda arguments, key: {"amount": 39.9},
+            )
+        ]
+    )
+    executor = RunExecutor(
+        repository,
+        model_provider=provider,
+        tool_registry=registry,
+    )
+
+    result = executor.run_loop(
+        run={
+            "id": "run-123",
+            "org_id": "org-1",
+            "run_type": "support_ticket",
+            "input": {"ticket_id": "T-9527"},
+        },
+        context=RunExecutor._initial_context(
+            {"input": {"ticket_id": "T-9527"}}
+        ),
+        worker_id="worker-1",
+    )
+
+    assert result == {"run_id": "run-123", "status": "succeeded"}
+    assert len(repository.saved) == 3
+    assert repository.saved[0][1]["state_json"]["last"] == "assistant"
+    assert repository.saved[1][1]["state_json"]["last"] == "tool_result"
+    assert repository.saved[2][1]["state_json"]["last"] == "assistant"
+    assert repository.finished["status"] == "succeeded"

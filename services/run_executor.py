@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -64,63 +65,7 @@ class RunExecutor:
         context = self._load_context(run)
 
         try:
-            for loop_index in range(1, self.max_steps + 1):
-                if self.repository.cancel_if_requested(run_id, worker_id):
-                    return {"run_id": run_id, "status": "cancelled"}
-
-                decision = self.run_model_step(
-                    run=run,
-                    context=context,
-                    step_index=(loop_index * 2) - 1,
-                )
-                context["messages"].append(
-                    self._assistant_message(decision)
-                )
-                context["last"] = "assistant"
-
-                if decision.tool_name is None:
-                    output = decision.final_answer or decision.response_json
-                    if not self.repository.finish_run(
-                        run_id,
-                        worker_id,
-                        "succeeded",
-                        output=output,
-                    ):
-                        return {"run_id": run_id, "status": "lease_lost"}
-                    return {"run_id": run_id, "status": "succeeded"}
-
-                if decision.tool_arguments is None:
-                    raise ValueError("Tool decision is missing arguments")
-
-                if self.repository.cancel_if_requested(run_id, worker_id):
-                    return {"run_id": run_id, "status": "cancelled"}
-
-                tool = self.tool_registry.get(decision.tool_name)
-                result = self.run_tool_round(
-                    run=run,
-                    tool=tool,
-                    decision=decision,
-                    step_index=loop_index * 2,
-                )
-                context["messages"].append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": decision.tool_use_id,
-                                "content": result,
-                            }
-                        ],
-                    }
-                )
-                context["completed_tool_calls"].append(
-                    decision.tool_use_id
-                )
-                context["last"] = "tool_result"
-                self._save_context(run, context)
-
-            raise RuntimeError("Maximum agent step count exceeded")
+            return self.run_loop(run, context, worker_id)
         except Exception as exc:
             if isinstance(exc, RetryableRunError):
                 raise
@@ -134,6 +79,74 @@ class RunExecutor:
                 },
             )
             raise
+
+    def run_loop(
+        self,
+        run: dict[str, Any],
+        context: dict[str, Any],
+        worker_id: str,
+    ) -> dict[str, Any]:
+        """Advance one model/tool round at a time from the current context."""
+        for loop_index in range(1, self.max_steps + 1):
+            if self.repository.cancel_if_requested(run["id"], worker_id):
+                return {"run_id": run["id"], "status": "cancelled"}
+
+            decision = self.run_model_step(
+                run=run,
+                context=context,
+                step_index=(loop_index * 2) - 1,
+            )
+            context["messages"].append(
+                self._assistant_message(decision)
+            )
+            context["last"] = "assistant"
+            self._save_context(run, context)
+
+            if decision.tool_name is None:
+                output = decision.final_answer or decision.response_json
+                if not self.repository.finish_run(
+                    run["id"],
+                    worker_id,
+                    "succeeded",
+                    output=output,
+                ):
+                    return {"run_id": run["id"], "status": "lease_lost"}
+                return {"run_id": run["id"], "status": "succeeded"}
+
+            if decision.tool_arguments is None:
+                raise PermanentRunError(
+                    "tool_decision_missing_arguments"
+                )
+
+            if self.repository.cancel_if_requested(run["id"], worker_id):
+                return {"run_id": run["id"], "status": "cancelled"}
+
+            tool = self.tool_registry.get(decision.tool_name)
+            result = self.run_tool_round(
+                run=run,
+                tool=tool,
+                decision=decision,
+                step_index=loop_index * 2,
+            )
+            context["messages"].append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": decision.tool_use_id,
+                            "content": result,
+                        }
+                    ],
+                }
+            )
+            context["completed_tool_calls"].append(
+                decision.tool_use_id
+            )
+            context["last"] = "tool_result"
+            self._save_context(run, context)
+
+        raise PermanentRunError("max_loop_steps_exceeded")
 
     def run_model_step(
         self,
@@ -414,7 +427,7 @@ class RunExecutor:
                 "id": str(uuid4()),
                 "run_id": run["id"],
                 "checkpoint_index": checkpoint_index,
-                "state_json": context,
+                "state_json": deepcopy(context),
                 "created_at": self._now(),
             },
         )
