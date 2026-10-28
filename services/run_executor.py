@@ -10,7 +10,12 @@ from services.run_errors import (
     PermanentRunError,
     TransientRunError,
 )
-from services.tool_runtime import ToolDefinition, ToolRegistry, ToolRuntime
+from services.tool_runtime import (
+    ToolContext,
+    ToolDefinition,
+    ToolRegistry,
+    ToolRuntime,
+)
 
 
 class ModelProvider(Protocol):
@@ -505,6 +510,13 @@ class RunExecutor:
                 tool=tool,
                 arguments=arguments,
                 idempotency_key=idempotency_key,
+                context=ToolContext(
+                    org_id=run["org_id"],
+                    user_id=run.get("user_id", "system"),
+                    run_id=run["id"],
+                    step_id=step_id,
+                    permissions=frozenset(run.get("permissions", ())),
+                ),
             )
             self.repository.record_tool_call(
                 run["org_id"],

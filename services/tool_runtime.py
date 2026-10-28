@@ -101,6 +101,13 @@ class ToolDefinition:
         )
 
 
+PermissionChecker = Callable[[str, ToolContext], bool]
+ResourceAuthorizer = Callable[
+    [ToolDefinition, dict[str, Any], ToolContext],
+    bool,
+]
+
+
 class ToolRegistry:
     """Resolve model-selected tool names without business logic in the loop."""
 
@@ -131,6 +138,66 @@ class ToolRegistry:
 
 class ToolRuntime:
     """Execute a resolved tool and normalize runtime failures."""
+
+    def __init__(
+        self,
+        *,
+        permission_checker: PermissionChecker | None = None,
+        resource_authorizer: ResourceAuthorizer | None = None,
+    ) -> None:
+        self.permission_checker = permission_checker
+        self.resource_authorizer = resource_authorizer
+
+    def _check_authorization(
+        self,
+        *,
+        tool: ToolDefinition,
+        arguments: dict[str, Any],
+        context: ToolContext | None,
+    ) -> None:
+        if tool.permission is None and self.resource_authorizer is None:
+            return
+
+        if context is None:
+            raise PermanentRunError(
+                f"Tool context is required for {tool.name} authorization"
+            )
+
+        if tool.permission is not None:
+            checker = self.permission_checker or self._default_permission_checker
+            try:
+                allowed = checker(tool.permission, context)
+            except PermissionError as exc:
+                raise PermanentRunError(
+                    f"Permission denied for {tool.name}: {exc}"
+                ) from exc
+            if not allowed:
+                raise PermanentRunError(
+                    f"Permission denied for {tool.name}"
+                )
+
+        if self.resource_authorizer is not None:
+            try:
+                resource_allowed = self.resource_authorizer(
+                    tool,
+                    arguments,
+                    context,
+                )
+            except PermissionError as exc:
+                raise PermanentRunError(
+                    f"Resource access denied for {tool.name}: {exc}"
+                ) from exc
+            if not resource_allowed:
+                raise PermanentRunError(
+                    f"Resource access denied for {tool.name}"
+                )
+
+    @staticmethod
+    def _default_permission_checker(
+        permission: str,
+        context: ToolContext,
+    ) -> bool:
+        return permission in context.permissions
 
     @staticmethod
     def _validate_input(
@@ -182,11 +249,12 @@ class ToolRuntime:
         idempotency_key: str | None = None,
         context: ToolContext | None = None,
     ) -> dict[str, Any]:
-        # ``context`` is accepted as part of the public contract now.  The
-        # authorization and persistence gates are introduced in later steps;
-        # keeping it optional preserves the existing executor integration.
-        del context
         validated_arguments = self._validate_input(tool, arguments)
+        self._check_authorization(
+            tool=tool,
+            arguments=validated_arguments,
+            context=context,
+        )
 
         try:
             result = tool.handler(validated_arguments, idempotency_key)
