@@ -922,6 +922,43 @@ class SqlAlchemyRunRepository:
             db.flush()
             return self._tool_call_to_dict(db_call)
 
+    def update_tool_call(
+        self,
+        org_id: str,
+        tool_call_id: str,
+        updates: dict[str, Any],
+    ) -> dict[str, Any]:
+        with SessionLocal.begin() as db:
+            db_call = db.scalar(
+                select(ToolCall)
+                .join(AgentRun, AgentRun.id == ToolCall.run_id)
+                .where(
+                    ToolCall.id == tool_call_id,
+                    AgentRun.org_id == org_id,
+                )
+            )
+            if db_call is None:
+                raise ValueError("Tool call not found")
+
+            if "status" in updates:
+                db_call.status = updates["status"]
+            if "result_json" in updates:
+                db_call.result_json = updates["result_json"]
+            if "error_json" in updates:
+                db_call.error_json = updates["error_json"]
+            if "latency_ms" in updates:
+                db_call.latency_ms = updates["latency_ms"]
+            if "ended_at" in updates:
+                ended_at = updates["ended_at"]
+                db_call.ended_at = (
+                    self._datetime(ended_at)
+                    if ended_at is not None
+                    else None
+                )
+
+            db.flush()
+            return self._tool_call_to_dict(db_call)
+
     def get_tool_call_by_idempotency_key(
         self,
         org_id: str,

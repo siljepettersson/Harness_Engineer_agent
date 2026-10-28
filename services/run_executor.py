@@ -58,7 +58,9 @@ class RunExecutor:
         self.repository = repository
         self.model_provider = model_provider
         self.tool_registry = tool_registry
-        self.tool_runtime = tool_runtime or ToolRuntime()
+        self.tool_runtime = tool_runtime or ToolRuntime(
+            tool_call_store=repository,
+        )
         self.max_steps = max_steps
 
     def execute(self, run_id: str, worker_id: str) -> dict[str, Any]:
@@ -518,21 +520,6 @@ class RunExecutor:
                     permissions=frozenset(run.get("permissions", ())),
                 ),
             )
-            self.repository.record_tool_call(
-                run["org_id"],
-                {
-                    "id": str(uuid4()),
-                    "run_id": run["id"],
-                    "step_id": step_id,
-                    "tool_name": tool.name,
-                    "args_json": arguments,
-                    "result_json": result,
-                    "status": "succeeded",
-                    "idempotency_key": idempotency_key,
-                    "created_at": started_at,
-                    "ended_at": self._now(),
-                },
-            )
             self.repository.update_step(
                 run["org_id"],
                 step_id,
@@ -557,21 +544,6 @@ class RunExecutor:
                 "type": type(exc).__name__,
                 "message": str(exc),
             }
-            self.repository.record_tool_call(
-                run["org_id"],
-                {
-                    "id": str(uuid4()),
-                    "run_id": run["id"],
-                    "step_id": step_id,
-                    "tool_name": tool.name,
-                    "args_json": arguments,
-                    "status": "failed",
-                    "idempotency_key": idempotency_key,
-                    "error_json": error,
-                    "created_at": started_at,
-                    "ended_at": self._now(),
-                },
-            )
             self.repository.update_step(
                 run["org_id"],
                 step_id,

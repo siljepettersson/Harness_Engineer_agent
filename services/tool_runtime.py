@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from datetime import datetime, timezone
+from typing import Any, Callable, Protocol
+from uuid import uuid4
 
 from pydantic import ValidationError
 
@@ -108,6 +110,30 @@ ResourceAuthorizer = Callable[
 ]
 
 
+class ToolCallStore(Protocol):
+    """Persistence contract used by ToolRuntime for call lifecycle records."""
+
+    def get_tool_call_by_idempotency_key(
+        self,
+        org_id: str,
+        tool_name: str,
+        idempotency_key: str,
+    ) -> dict[str, Any] | None: ...
+
+    def record_tool_call(
+        self,
+        org_id: str,
+        call: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def update_tool_call(
+        self,
+        org_id: str,
+        tool_call_id: str,
+        updates: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+
 class ToolRegistry:
     """Resolve model-selected tool names without business logic in the loop."""
 
@@ -144,9 +170,141 @@ class ToolRuntime:
         *,
         permission_checker: PermissionChecker | None = None,
         resource_authorizer: ResourceAuthorizer | None = None,
+        tool_call_store: ToolCallStore | None = None,
     ) -> None:
         self.permission_checker = permission_checker
         self.resource_authorizer = resource_authorizer
+        self.tool_call_store = tool_call_store
+
+    @staticmethod
+    def _now() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _update_tool_call(
+        self,
+        *,
+        call: dict[str, Any],
+        updates: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Update a lifecycle record, with an in-memory compatibility path."""
+        if self.tool_call_store is None:
+            call.update(updates)
+            return call
+
+        updater = getattr(self.tool_call_store, "update_tool_call", None)
+        if updater is not None:
+            return updater(
+                call["org_id"],
+                call["id"],
+                updates,
+            )
+
+        # Existing lightweight repositories return and retain the same dict.
+        # Mutating it preserves their behavior until they implement the
+        # durable update method.
+        call.update(updates)
+        return call
+
+    def _start_tool_call(
+        self,
+        *,
+        tool: ToolDefinition,
+        arguments: dict[str, Any],
+        idempotency_key: str | None,
+        context: ToolContext,
+    ) -> dict[str, Any] | None:
+        if self.tool_call_store is None:
+            return None
+
+        started_at = self._now()
+        call = {
+            "id": str(uuid4()),
+            "org_id": context.org_id,
+            "run_id": context.run_id,
+            "step_id": context.step_id,
+            "tool_name": tool.name,
+            "args_json": arguments,
+            "status": "running",
+            "idempotency_key": idempotency_key,
+            "created_at": started_at,
+        }
+        persisted = self.tool_call_store.record_tool_call(
+            context.org_id,
+            call,
+        )
+        # The SQLAlchemy repository returns a detached dict without org_id;
+        # retain it locally for the later update call.
+        persisted.setdefault("org_id", context.org_id)
+        return persisted
+
+    def _existing_tool_call(
+        self,
+        *,
+        tool: ToolDefinition,
+        idempotency_key: str | None,
+        context: ToolContext | None,
+    ) -> dict[str, Any] | None:
+        if (
+            self.tool_call_store is None
+            or context is None
+            or idempotency_key is None
+        ):
+            return None
+
+        return self.tool_call_store.get_tool_call_by_idempotency_key(
+            org_id=context.org_id,
+            tool_name=tool.name,
+            idempotency_key=idempotency_key,
+        )
+
+    @staticmethod
+    def _duplicate_result(
+        *,
+        tool: ToolDefinition,
+        existing: dict[str, Any],
+    ) -> dict[str, Any]:
+        if existing.get("status") in {"succeeded", "skipped_duplicate"}:
+            result = existing.get("result_json")
+            if isinstance(result, dict):
+                return result
+        raise PermanentRunError(
+            f"Tool call already exists for {tool.name}"
+        )
+
+    def _prepare_idempotency(
+        self,
+        *,
+        tool: ToolDefinition,
+        idempotency_key: str | None,
+        context: ToolContext | None,
+    ) -> dict[str, Any] | None:
+        if tool.idempotency_required and not idempotency_key:
+            raise PermanentRunError(
+                f"Idempotency key required for {tool.name}"
+            )
+
+        if idempotency_key is None:
+            return None
+
+        if self.tool_call_store is None:
+            if tool.idempotency_required:
+                raise PermanentRunError(
+                    f"Tool call store is required for {tool.name} idempotency"
+                )
+            return None
+        if context is None:
+            raise PermanentRunError(
+                f"Tool context is required for {tool.name} idempotency"
+            )
+
+        existing = self._existing_tool_call(
+            tool=tool,
+            idempotency_key=idempotency_key,
+            context=context,
+        )
+        if existing is not None:
+            return existing
+        return None
 
     def _check_authorization(
         self,
@@ -256,14 +414,83 @@ class ToolRuntime:
             context=context,
         )
 
+        existing = self._prepare_idempotency(
+            tool=tool,
+            idempotency_key=idempotency_key,
+            context=context,
+        )
+        if existing is not None:
+            return self._duplicate_result(tool=tool, existing=existing)
+
+        tool_call = None
+        if self.tool_call_store is not None:
+            if context is None:
+                raise PermanentRunError(
+                    f"Tool context is required to record {tool.name}"
+                )
+            tool_call = self._start_tool_call(
+                tool=tool,
+                arguments=validated_arguments,
+                idempotency_key=idempotency_key,
+                context=context,
+            )
+
         try:
             result = tool.handler(validated_arguments, idempotency_key)
-            return self._validate_output(tool, result)
+            validated_result = self._validate_output(tool, result)
+            if tool_call is not None:
+                self._update_tool_call(
+                    call=tool_call,
+                    updates={
+                        "status": "succeeded",
+                        "result_json": validated_result,
+                        "ended_at": self._now(),
+                    },
+                )
+            return validated_result
         except (TimeoutError, ConnectionError) as exc:
+            if tool_call is not None:
+                self._update_tool_call(
+                    call=tool_call,
+                    updates={
+                        "status": "failed",
+                        "error_json": {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                        "ended_at": self._now(),
+                    },
+                )
             raise TransientRunError(
                 f"Transient failure in {tool.name}: {exc}"
             ) from exc
         except PermissionError as exc:
+            if tool_call is not None:
+                self._update_tool_call(
+                    call=tool_call,
+                    updates={
+                        "status": "failed",
+                        "error_json": {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                        "ended_at": self._now(),
+                    },
+                )
             raise PermanentRunError(
                 f"Permission denied for {tool.name}: {exc}"
             ) from exc
+        except Exception as exc:
+            if tool_call is not None:
+                self._update_tool_call(
+                    call=tool_call,
+                    updates={
+                        "status": "failed",
+                        "error_json": {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                        "ended_at": self._now(),
+                    },
+                )
+            raise
