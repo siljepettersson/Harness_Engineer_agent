@@ -5,7 +5,10 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from repositories.run_repository import SqlAlchemyRunRepository, run_repository
-from services.run_errors import PermanentRunError, RetryableRunError
+from services.run_errors import (
+    PermanentRunError,
+    TransientRunError,
+)
 from services.tool_runtime import ToolDefinition, ToolRegistry, ToolRuntime
 
 
@@ -66,10 +69,21 @@ class RunExecutor:
 
         try:
             return self.run_loop(run, context, worker_id)
-        except Exception as exc:
-            if isinstance(exc, RetryableRunError):
-                raise
-            self.repository.finish_run(
+        except TransientRunError as exc:
+            result = self.repository.schedule_retry(
+                run_id=run_id,
+                worker_id=worker_id,
+                error={
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            return {
+                "run_id": run_id,
+                "status": result["status"],
+            }
+        except PermanentRunError as exc:
+            finished = self.repository.finish_run(
                 run_id,
                 worker_id,
                 "failed",
@@ -78,7 +92,10 @@ class RunExecutor:
                     "message": str(exc),
                 },
             )
-            raise
+            return {
+                "run_id": run_id,
+                "status": "failed" if finished else "lease_lost",
+            }
 
     def run_loop(
         self,

@@ -73,6 +73,14 @@ class CheckpointRepository:
         }
         return True
 
+    def schedule_retry(self, run_id, worker_id, error):
+        self.retry = {
+            "run_id": run_id,
+            "worker_id": worker_id,
+            "error": error,
+        }
+        return {"status": "queued"}
+
 
 def test_new_run_context_uses_canonical_message_list():
     context = RunExecutor._initial_context(
@@ -475,3 +483,66 @@ def test_run_loop_checkpoints_model_output_and_tool_result():
     assert repository.saved[1][1]["state_json"]["last"] == "tool_result"
     assert repository.saved[2][1]["state_json"]["last"] == "assistant"
     assert repository.finished["status"] == "succeeded"
+
+
+class ExecuteRepository(CheckpointRepository):
+    def __init__(self, run):
+        super().__init__()
+        self.run = run
+
+    def claim_run(self, run_id, worker_id):
+        return self.run
+
+
+def test_execute_handles_transient_errors_inside_execute_run():
+    repository = ExecuteRepository(
+        {
+            "id": "run-123",
+            "org_id": "org-1",
+            "run_type": "support_ticket",
+            "input": {"ticket_id": "T-9527"},
+        }
+    )
+
+    class FailingProvider:
+        def complete(self, *, context):
+            raise TransientRunError("provider_503")
+
+    executor = RunExecutor(
+        repository,
+        model_provider=FailingProvider(),
+        tool_registry=ToolRegistry(),
+    )
+
+    result = executor.execute("run-123", "worker-1")
+
+    assert result == {"run_id": "run-123", "status": "queued"}
+    assert repository.retry["error"]["type"] == "TransientRunError"
+    assert repository.finished is None
+
+
+def test_execute_terminalizes_permanent_errors_inside_execute_run():
+    repository = ExecuteRepository(
+        {
+            "id": "run-123",
+            "org_id": "org-1",
+            "run_type": "support_ticket",
+            "input": {"ticket_id": "T-9527"},
+        }
+    )
+
+    class FailingProvider:
+        def complete(self, *, context):
+            raise PermanentRunError("invalid_request")
+
+    executor = RunExecutor(
+        repository,
+        model_provider=FailingProvider(),
+        tool_registry=ToolRegistry(),
+    )
+
+    result = executor.execute("run-123", "worker-1")
+
+    assert result == {"run_id": "run-123", "status": "failed"}
+    assert repository.finished["status"] == "failed"
+    assert repository.finished["error"]["type"] == "PermanentRunError"
