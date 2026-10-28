@@ -24,6 +24,10 @@ IdempotencyKeyFactory = Callable[
     str,
 ]
 ArgumentValidator = Callable[[dict[str, Any]], None]
+PreviewBuilder = Callable[
+    [dict[str, Any], "ToolContext"],
+    dict[str, Any],
+]
 
 
 @dataclass(frozen=True)
@@ -77,6 +81,7 @@ class ToolDefinition:
     network_policy: dict[str, Any] | None = None
     data_classification: str | None = None
     audit_required: bool = False
+    preview_builder: PreviewBuilder | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -107,6 +112,14 @@ class ToolDefinition:
             raise ValueError(
                 "high-risk tools must define an approval policy"
             )
+        if self.preview_builder is not None and not callable(self.preview_builder):
+            raise TypeError("preview_builder must be callable")
+
+        # High-risk tools always require the same approval and audit gates,
+        # even when a caller omitted the legacy boolean/flag fields.
+        if self.risk_level == "high":
+            object.__setattr__(self, "requires_approval", True)
+            object.__setattr__(self, "audit_required", True)
 
         object.__setattr__(
             self,
@@ -178,6 +191,16 @@ class ToolCallStore(Protocol):
     ) -> dict[str, Any]: ...
 
 
+class AuditLogStore(Protocol):
+    """Persistence contract for governance/audit records."""
+
+    def record_audit_log(
+        self,
+        org_id: str,
+        log: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+
 class ToolRegistry:
     """Resolve model-selected tool names without business logic in the loop."""
 
@@ -219,10 +242,16 @@ class ToolRuntime:
         permission_checker: PermissionChecker | None = None,
         resource_authorizer: ResourceAuthorizer | None = None,
         tool_call_store: ToolCallStore | None = None,
+        audit_store: AuditLogStore | None = None,
     ) -> None:
         self.permission_checker = permission_checker
         self.resource_authorizer = resource_authorizer
         self.tool_call_store = tool_call_store
+        self.audit_store = audit_store or (
+            tool_call_store
+            if callable(getattr(tool_call_store, "record_audit_log", None))
+            else None
+        )
 
     @staticmethod
     def _invoke_with_timeout(
@@ -396,6 +425,104 @@ class ToolRuntime:
         call.update(updates)
         return call
 
+    def _write_audit(
+        self,
+        *,
+        tool: ToolDefinition,
+        context: ToolContext | None,
+        status: str,
+        idempotency_key: str | None,
+        tool_call: dict[str, Any] | None = None,
+        result: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> None:
+        if not tool.audit_required or self.audit_store is None or context is None:
+            return
+
+        metadata: dict[str, Any] = {
+            "tool_name": tool.name,
+            "tool_version": tool.tool_version,
+            "risk_level": tool.risk_level,
+            "status": status,
+            "idempotency_key": idempotency_key,
+        }
+        if tool_call is not None:
+            metadata["tool_call_id"] = tool_call.get("id")
+        if result is not None:
+            metadata["result"] = result
+        if error is not None:
+            metadata["error"] = error
+
+        # The audit record is deliberately written after the lifecycle update.
+        # A failure to write an audit row must not turn a completed external
+        # side effect into a misleading local failure.
+        try:
+            self.audit_store.record_audit_log(
+                context.org_id,
+                {
+                    "id": str(uuid4()),
+                    "actor": context.user_id,
+                    "run_id": context.run_id,
+                    "action": f"tool.{status}",
+                    "target_type": "tool",
+                    "target_id": tool.name,
+                    "metadata_json": metadata,
+                    "created_at": self._now(),
+                },
+            )
+        except Exception:
+            # The tool call and event trail remain authoritative for execution
+            # recovery.  Audit persistence is isolated so it cannot cause a
+            # second refund/message attempt after a side effect completed.
+            return
+
+    def build_preview(
+        self,
+        *,
+        tool: ToolDefinition,
+        arguments: dict[str, Any],
+        context: ToolContext,
+    ) -> dict[str, Any]:
+        """Validate and authorize a request without executing its handler."""
+        validated_arguments = self._validate_input(tool, arguments)
+        self._check_authorization(
+            tool=tool,
+            arguments=validated_arguments,
+            context=context,
+        )
+
+        if tool.preview_builder is not None:
+            try:
+                preview = tool.preview_builder(validated_arguments, context)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise NonRetryableToolError(
+                    ToolErrorPayload(
+                        code="TOOL_PREVIEW_ERROR",
+                        message=f"Unable to build preview for {tool.name}: {exc}",
+                        retryable=False,
+                    )
+                ) from exc
+            if not isinstance(preview, dict):
+                raise NonRetryableToolError(
+                    ToolErrorPayload(
+                        code="TOOL_PREVIEW_ERROR",
+                        message=f"Preview for {tool.name} must be an object",
+                        retryable=False,
+                    )
+                )
+            return preview
+
+        # A generic preview is still useful for tools whose safe preview is
+        # exactly their validated request.  Sensitive business values should
+        # be omitted by a tool-specific preview_builder when necessary.
+        return {
+            "tool_name": tool.name,
+            "tool_version": tool.tool_version,
+            "risk_level": tool.risk_level,
+            "arguments": validated_arguments,
+            "approval_policy": tool.approval_policy,
+        }
+
     def _start_tool_call(
         self,
         *,
@@ -448,15 +575,25 @@ class ToolRuntime:
             idempotency_key=idempotency_key,
         )
 
-    @staticmethod
     def _duplicate_result(
+        self,
         *,
         tool: ToolDefinition,
         existing: dict[str, Any],
+        context: ToolContext | None,
+        idempotency_key: str | None,
     ) -> dict[str, Any]:
         if existing.get("status") in {"succeeded", "skipped_duplicate"}:
             result = existing.get("result_json")
             if isinstance(result, dict):
+                self._write_audit(
+                    tool=tool,
+                    context=context,
+                    status="skipped_duplicate",
+                    idempotency_key=idempotency_key,
+                    tool_call=existing,
+                    result=result,
+                )
                 return result
         raise NonRetryableToolError(
             ToolErrorPayload(
@@ -665,7 +802,30 @@ class ToolRuntime:
             context=context,
         )
         if existing is not None:
-            return self._duplicate_result(tool=tool, existing=existing)
+            return self._duplicate_result(
+                tool=tool,
+                existing=existing,
+                context=context,
+                idempotency_key=idempotency_key,
+            )
+
+        if tool.audit_required:
+            if context is None:
+                raise NonRetryableToolError(
+                    ToolErrorPayload(
+                        code="TOOL_CONTEXT_REQUIRED",
+                        message=f"Tool context is required to audit {tool.name}",
+                        retryable=False,
+                    )
+                )
+            if self.audit_store is None:
+                raise NonRetryableToolError(
+                    ToolErrorPayload(
+                        code="TOOL_AUDIT_STORE_UNAVAILABLE",
+                        message=f"Audit store is required for {tool.name}",
+                        retryable=False,
+                    )
+                )
 
         tool_call = None
         if self.tool_call_store is not None:
@@ -700,6 +860,14 @@ class ToolRuntime:
                         "ended_at": self._now(),
                     },
                 )
+            self._write_audit(
+                tool=tool,
+                context=context,
+                status="succeeded",
+                idempotency_key=idempotency_key,
+                tool_call=tool_call,
+                result=validated_result,
+            )
             return validated_result
         except ResponseLostToolError as exc:
             if tool_call is not None:
@@ -711,6 +879,14 @@ class ToolRuntime:
                         "ended_at": self._now(),
                     },
                 )
+            self._write_audit(
+                tool=tool,
+                context=context,
+                status="response_lost",
+                idempotency_key=idempotency_key,
+                tool_call=tool_call,
+                error=exc.tool_error,
+            )
             raise
         except (RetryableToolError, NonRetryableToolError) as exc:
             if tool_call is not None:
@@ -722,19 +898,36 @@ class ToolRuntime:
                         "ended_at": self._now(),
                     },
                 )
+            self._write_audit(
+                tool=tool,
+                context=context,
+                status="failed",
+                idempotency_key=idempotency_key,
+                tool_call=tool_call,
+                error=exc.tool_error,
+            )
             raise
         except PermanentRunError as exc:
+            error = {
+                "code": "TOOL_OUTPUT_VALIDATION_ERROR",
+                "message": str(exc),
+                "retryable": False,
+            }
             if tool_call is not None:
                 self._update_tool_call(
                     call=tool_call,
                     updates={
                         "status": "failed",
-                        "error_json": {
-                            "code": "TOOL_OUTPUT_VALIDATION_ERROR",
-                            "message": str(exc),
-                            "retryable": False,
-                        },
+                        "error_json": error,
                         "ended_at": self._now(),
                     },
                 )
+            self._write_audit(
+                tool=tool,
+                context=context,
+                status="failed",
+                idempotency_key=idempotency_key,
+                tool_call=tool_call,
+                error=error,
+            )
             raise

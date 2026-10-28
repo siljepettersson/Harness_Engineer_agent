@@ -308,6 +308,17 @@ class RunExecutor:
         worker_id: str,
     ) -> None:
         step_id = str(uuid4())
+        preview = self.tool_runtime.build_preview(
+            tool=tool,
+            arguments=decision.tool_arguments or {},
+            context=ToolContext(
+                org_id=run["org_id"],
+                user_id=run.get("user_id", "system"),
+                run_id=run["id"],
+                step_id=step_id,
+                permissions=frozenset(run.get("permissions", ())),
+            ),
+        )
         self.repository.create_step(
             run["org_id"],
             {
@@ -329,6 +340,9 @@ class RunExecutor:
                 "step_id": step_id,
                 "tool_name": tool.name,
                 "tool_use_id": decision.tool_use_id,
+                "risk_level": tool.risk_level,
+                "approval_policy": tool.approval_policy,
+                "preview": preview,
             },
         )
         self.repository.wait_for_user(
