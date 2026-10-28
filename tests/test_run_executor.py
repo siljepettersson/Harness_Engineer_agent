@@ -22,6 +22,7 @@ class CheckpointRepository:
         self.tool_calls = []
         self.events = []
         self.finished = None
+        self.existing_tool_call = None
 
     def get_latest_checkpoint(self, *, run_id, org_id):
         return self.checkpoint
@@ -51,6 +52,15 @@ class CheckpointRepository:
     def record_tool_call(self, org_id, call):
         self.tool_calls.append(call)
         return call
+
+    def get_tool_call_by_idempotency_key(
+        self,
+        *,
+        org_id,
+        tool_name,
+        idempotency_key,
+    ):
+        return self.existing_tool_call
 
     def append_event(self, org_id, run_id, event_type, payload=None):
         self.events.append(event_type)
@@ -617,3 +627,74 @@ def test_run_loop_releases_worker_when_tool_approval_is_required():
     assert repository.waiting["reason"] == "tool_approval_required"
     assert repository.waiting["checkpoint_state"]["last"] == "assistant"
     assert not repository.tool_calls
+
+
+def test_run_loop_reuses_succeeded_tool_call_after_recovery():
+    repository = CheckpointRepository()
+    repository.existing_tool_call = {
+        "status": "succeeded",
+        "result_json": {"amount": 39.9},
+    }
+    provider = ScriptedModelProvider(
+        [
+            ModelDecision(
+                provider="fake",
+                model="fake-model",
+                response_json={"text": "refund can proceed"},
+                final_answer={"answer": "refund can proceed"},
+            )
+        ]
+    )
+    calls = []
+    registry = ToolRegistry(
+        [
+            ToolDefinition(
+                name="get_order",
+                handler=lambda arguments, key: calls.append(arguments),
+            )
+        ]
+    )
+    executor = RunExecutor(
+        repository,
+        model_provider=provider,
+        tool_registry=registry,
+    )
+    context = {
+        "messages": [
+            {
+                "role": "user",
+                "content": {"ticket_id": "T-9527"},
+            },
+            {
+                "role": "assistant",
+                "content": {
+                    "text": "查订单",
+                    "tool_use": {
+                        "id": "tc_get_order_1",
+                        "name": "get_order",
+                        "input": {"order_id": "ORD-10086"},
+                    },
+                },
+            },
+        ],
+        "completed_tool_calls": [],
+        "last": "assistant",
+    }
+
+    result = executor.run_loop(
+        run={
+            "id": "run-123",
+            "org_id": "org-1",
+            "run_type": "support_ticket",
+            "input": {"ticket_id": "T-9527"},
+        },
+        context=context,
+        worker_id="worker-recovery",
+    )
+
+    assert result == {"run_id": "run-123", "status": "succeeded"}
+    assert calls == []
+    assert provider.contexts[0]["last"] == "tool_result"
+    assert provider.contexts[0]["messages"][-1]["content"][0][
+        "tool_use_id"
+    ] == "tc_get_order_1"

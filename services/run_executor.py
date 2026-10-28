@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from repositories.run_repository import SqlAlchemyRunRepository, run_repository
 from services.run_errors import (
+    ApprovalRequired,
     PermanentRunError,
     TransientRunError,
 )
@@ -69,6 +70,11 @@ class RunExecutor:
 
         try:
             return self.run_loop(run, context, worker_id)
+        except ApprovalRequired:
+            return {
+                "run_id": run_id,
+                "status": "waiting_for_user",
+            }
         except TransientRunError as exc:
             result = self.repository.schedule_retry(
                 run_id=run_id,
@@ -104,10 +110,27 @@ class RunExecutor:
         worker_id: str,
     ) -> dict[str, Any]:
         """Advance one model/tool round at a time from the current context."""
-        for loop_index in range(1, self.max_steps + 1):
+        for _ in range(1, self.max_steps + 1):
             if self.repository.cancel_if_requested(run["id"], worker_id):
                 return {"run_id": run["id"], "status": "cancelled"}
 
+            pending_decision = self._pending_tool_decision(context)
+            if pending_decision is not None:
+                result = self._resume_tool_use(
+                    run=run,
+                    context=context,
+                    decision=pending_decision,
+                    worker_id=worker_id,
+                )
+                self._append_tool_result(
+                    context,
+                    pending_decision,
+                    result,
+                )
+                self._save_context(run, context)
+                continue
+
+            loop_index = len(context["completed_tool_calls"]) + 1
             decision = self.run_model_step(
                 run=run,
                 context=context,
@@ -159,25 +182,106 @@ class RunExecutor:
                 decision=decision,
                 step_index=loop_index * 2,
             )
-            context["messages"].append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": decision.tool_use_id,
-                            "content": result,
-                        }
-                    ],
-                }
-            )
-            context["completed_tool_calls"].append(
-                decision.tool_use_id
-            )
-            context["last"] = "tool_result"
+            self._append_tool_result(context, decision, result)
             self._save_context(run, context)
 
         raise PermanentRunError("max_loop_steps_exceeded")
+
+    def _resume_tool_use(
+        self,
+        *,
+        run: dict[str, Any],
+        context: dict[str, Any],
+        decision: ModelDecision,
+        worker_id: str,
+    ) -> dict[str, Any]:
+        if decision.tool_name is None or decision.tool_arguments is None:
+            raise PermanentRunError("invalid_pending_tool_use")
+
+        tool = self.tool_registry.get(decision.tool_name)
+        if (
+            tool.requires_approval
+            and not self._approval_granted(run, decision)
+        ):
+            self._pause_for_approval(
+                run=run,
+                context=context,
+                tool=tool,
+                decision=decision,
+                step_index=len(context["completed_tool_calls"]) * 2 + 2,
+                worker_id=worker_id,
+            )
+            raise ApprovalRequired("tool_approval_required")
+
+        key = self._tool_idempotency_key(
+            run,
+            tool,
+            decision.tool_arguments,
+            decision.tool_use_id,
+        )
+        existing = self.repository.get_tool_call_by_idempotency_key(
+            org_id=run["org_id"],
+            tool_name=tool.name,
+            idempotency_key=key,
+        )
+        if existing is not None and existing["status"] == "succeeded":
+            return existing["result_json"]
+
+        return self.run_tool_round(
+            run=run,
+            tool=tool,
+            decision=decision,
+            step_index=len(context["completed_tool_calls"]) * 2 + 2,
+        )
+
+    @staticmethod
+    def _pending_tool_decision(
+        context: dict[str, Any],
+    ) -> ModelDecision | None:
+        if context.get("last") != "assistant":
+            return None
+        if not context.get("messages"):
+            return None
+
+        message = context["messages"][-1]
+        content = message.get("content")
+        if not isinstance(content, dict):
+            return None
+        tool_use = content.get("tool_use")
+        if not isinstance(tool_use, dict):
+            return None
+
+        return ModelDecision(
+            provider="recovery",
+            model="recovery",
+            response_json=content,
+            tool_name=tool_use.get("name"),
+            tool_arguments=tool_use.get("input"),
+            tool_use_id=tool_use.get("id"),
+        )
+
+    @staticmethod
+    def _append_tool_result(
+        context: dict[str, Any],
+        decision: ModelDecision,
+        result: dict[str, Any],
+    ) -> None:
+        context["messages"].append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": decision.tool_use_id,
+                        "content": result,
+                    }
+                ],
+            }
+        )
+        context["completed_tool_calls"].append(
+            decision.tool_use_id
+        )
+        context["last"] = "tool_result"
 
     @staticmethod
     def _approval_granted(

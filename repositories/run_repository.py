@@ -922,6 +922,24 @@ class SqlAlchemyRunRepository:
             db.flush()
             return self._tool_call_to_dict(db_call)
 
+    def get_tool_call_by_idempotency_key(
+        self,
+        org_id: str,
+        tool_name: str,
+        idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        with SessionLocal() as db:
+            call = db.scalar(
+                select(ToolCall)
+                .join(AgentRun, AgentRun.id == ToolCall.run_id)
+                .where(
+                    AgentRun.org_id == org_id,
+                    ToolCall.tool_name == tool_name,
+                    ToolCall.idempotency_key == idempotency_key,
+                )
+            )
+            return self._tool_call_to_dict(call) if call is not None else None
+
     def save_checkpoint(self, org_id: str, checkpoint: dict[str, Any]) -> dict[str, Any]:
         with SessionLocal.begin() as db:
             if not self._run_belongs_to_org(db, checkpoint["run_id"], org_id):
