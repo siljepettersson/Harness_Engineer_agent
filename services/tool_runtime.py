@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from pydantic import ValidationError
+
 from services.run_errors import PermanentRunError, TransientRunError
 
 
@@ -71,6 +73,14 @@ class ToolDefinition:
             raise ValueError("tool name must be a non-empty string")
         if not callable(self.handler):
             raise TypeError(f"handler for {self.name} must be callable")
+        for schema_name in ("input_schema", "output_schema"):
+            schema = getattr(self, schema_name)
+            if schema is not None and not callable(
+                getattr(schema, "model_validate", None)
+            ):
+                raise TypeError(
+                    f"{schema_name} for {self.name} must provide model_validate"
+                )
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than zero")
         if self.risk_level not in {"low", "medium", "high"}:
@@ -122,6 +132,48 @@ class ToolRegistry:
 class ToolRuntime:
     """Execute a resolved tool and normalize runtime failures."""
 
+    @staticmethod
+    def _validate_input(
+        tool: ToolDefinition,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        validated_arguments = arguments
+
+        if tool.input_schema is not None:
+            try:
+                model = tool.input_schema.model_validate(arguments)
+                validated_arguments = model.model_dump()
+            except (ValidationError, TypeError, ValueError) as exc:
+                raise PermanentRunError(
+                    f"Invalid arguments for {tool.name}: {exc}"
+                ) from exc
+
+        if tool.validate_arguments is not None:
+            try:
+                tool.validate_arguments(validated_arguments)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise PermanentRunError(
+                    f"Invalid arguments for {tool.name}: {exc}"
+                ) from exc
+
+        return validated_arguments
+
+    @staticmethod
+    def _validate_output(
+        tool: ToolDefinition,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        if tool.output_schema is None:
+            return result
+
+        try:
+            model = tool.output_schema.model_validate(result)
+            return model.model_dump()
+        except (ValidationError, TypeError, ValueError) as exc:
+            raise PermanentRunError(
+                f"Invalid result for {tool.name}: {exc}"
+            ) from exc
+
     def execute(
         self,
         *,
@@ -134,16 +186,11 @@ class ToolRuntime:
         # authorization and persistence gates are introduced in later steps;
         # keeping it optional preserves the existing executor integration.
         del context
-        if tool.validate_arguments is not None:
-            try:
-                tool.validate_arguments(arguments)
-            except (TypeError, ValueError, KeyError) as exc:
-                raise PermanentRunError(
-                    f"Invalid arguments for {tool.name}: {exc}"
-                ) from exc
+        validated_arguments = self._validate_input(tool, arguments)
 
         try:
-            return tool.handler(arguments, idempotency_key)
+            result = tool.handler(validated_arguments, idempotency_key)
+            return self._validate_output(tool, result)
         except (TimeoutError, ConnectionError) as exc:
             raise TransientRunError(
                 f"Transient failure in {tool.name}: {exc}"
