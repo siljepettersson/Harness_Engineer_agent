@@ -86,10 +86,7 @@ class RunExecutor:
             result = self.repository.schedule_retry(
                 run_id=run_id,
                 worker_id=worker_id,
-                error={
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                },
+                error=self._error_json(exc),
             )
             return {
                 "run_id": run_id,
@@ -100,10 +97,7 @@ class RunExecutor:
                 run_id,
                 worker_id,
                 "failed",
-                error={
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                },
+                error=self._error_json(exc),
             )
             return {
                 "run_id": run_id,
@@ -423,10 +417,7 @@ class RunExecutor:
             )
             return response
         except Exception as exc:
-            error = {
-                "type": type(exc).__name__,
-                "message": str(exc),
-            }
+            error = self._error_json(exc)
             self.repository.record_model_call(
                 run["org_id"],
                 {
@@ -540,10 +531,7 @@ class RunExecutor:
             )
             return result
         except Exception as exc:
-            error = {
-                "type": type(exc).__name__,
-                "message": str(exc),
-            }
+            error = self._error_json(exc)
             self.repository.update_step(
                 run["org_id"],
                 step_id,
@@ -563,6 +551,16 @@ class RunExecutor:
                 {"step_id": step_id, "step_type": "tool", "error": error},
             )
             raise
+
+    @staticmethod
+    def _error_json(exc: Exception) -> dict[str, Any]:
+        structured = getattr(exc, "tool_error", None)
+        if isinstance(structured, dict):
+            return structured
+        return {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
 
     @staticmethod
     def _initial_context(run: dict[str, Any]) -> dict[str, Any]:

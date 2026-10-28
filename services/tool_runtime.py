@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import time
 from typing import Any, Callable, Protocol
 from uuid import uuid4
 
@@ -63,6 +68,9 @@ class ToolDefinition:
     idempotency_required: bool = False
     timeout_seconds: float = 30.0
     retryable_errors: frozenset[str] = field(default_factory=frozenset)
+    max_attempts: int = 1
+    backoff_seconds: float = 0.0
+    downstream_deduplicates: bool = False
     tool_version: str | None = None
     risk_level: str = "low"
     approval_policy: dict[str, Any] | None = None
@@ -85,6 +93,10 @@ class ToolDefinition:
                 )
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than zero")
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be at least one")
+        if self.backoff_seconds < 0:
+            raise ValueError("backoff_seconds cannot be negative")
         if self.risk_level not in {"low", "medium", "high"}:
             raise ValueError("risk_level must be low, medium, or high")
         if self.side_effect and not self.idempotency_required:
@@ -108,6 +120,38 @@ ResourceAuthorizer = Callable[
     [ToolDefinition, dict[str, Any], ToolContext],
     bool,
 ]
+
+
+@dataclass(frozen=True)
+class ToolErrorPayload:
+    code: str
+    message: str
+    retryable: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+        }
+
+
+class RetryableToolError(TransientRunError):
+    def __init__(self, payload: ToolErrorPayload) -> None:
+        super().__init__(payload.message)
+        self.tool_error = payload.as_dict()
+
+
+class NonRetryableToolError(PermanentRunError):
+    def __init__(self, payload: ToolErrorPayload) -> None:
+        super().__init__(payload.message)
+        self.tool_error = payload.as_dict()
+
+
+class ResponseLostToolError(PermanentRunError):
+    def __init__(self, payload: ToolErrorPayload) -> None:
+        super().__init__(payload.message)
+        self.tool_error = payload.as_dict()
 
 
 class ToolCallStore(Protocol):
@@ -157,8 +201,12 @@ class ToolRegistry:
         try:
             return self._tools[name]
         except KeyError as exc:
-            raise PermanentRunError(
-                f"Unknown tool: {name}"
+            raise NonRetryableToolError(
+                ToolErrorPayload(
+                    code="TOOL_NOT_FOUND",
+                    message=f"Unknown tool: {name}",
+                    retryable=False,
+                )
             ) from exc
 
 
@@ -175,6 +223,149 @@ class ToolRuntime:
         self.permission_checker = permission_checker
         self.resource_authorizer = resource_authorizer
         self.tool_call_store = tool_call_store
+
+    @staticmethod
+    def _invoke_with_timeout(
+        tool: ToolDefinition,
+        arguments: dict[str, Any],
+        idempotency_key: str | None,
+    ) -> dict[str, Any]:
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            tool.handler,
+            arguments,
+            idempotency_key,
+        )
+        try:
+            result = future.result(timeout=tool.timeout_seconds)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError(
+                f"{tool.name} timed out after {tool.timeout_seconds}s"
+            ) from exc
+        except BaseException:
+            executor.shutdown(wait=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
+            return result
+
+    @staticmethod
+    def _safe_side_effect_retry(
+        *,
+        tool: ToolDefinition,
+        tool_call_store: ToolCallStore | None,
+    ) -> bool:
+        return bool(
+            tool.idempotency_required
+            and tool.downstream_deduplicates
+            and tool_call_store is not None
+        )
+
+    def _classify_handler_error(
+        self,
+        *,
+        tool: ToolDefinition,
+        exc: BaseException,
+    ) -> tuple[ToolErrorPayload, bool]:
+        status_code = getattr(exc, "status_code", None)
+        if status_code == 429:
+            code = "TOOL_RATE_LIMITED"
+        elif isinstance(status_code, int) and status_code >= 500:
+            code = "TOOL_UPSTREAM_ERROR"
+        elif isinstance(exc, TimeoutError):
+            if tool.side_effect and not self._safe_side_effect_retry(
+                tool=tool,
+                tool_call_store=self.tool_call_store,
+            ):
+                return (
+                    ToolErrorPayload(
+                        code="TOOL_RESPONSE_LOST",
+                        message=f"Response lost for {tool.name}",
+                        retryable=False,
+                    ),
+                    True,
+                )
+            code = "TOOL_TIMEOUT"
+        elif isinstance(exc, ConnectionError):
+            code = "TOOL_UPSTREAM_ERROR"
+        elif isinstance(exc, PermissionError):
+            return (
+                ToolErrorPayload(
+                    code="TOOL_PERMISSION_DENIED",
+                    message=f"Permission denied for {tool.name}: {exc}",
+                    retryable=False,
+                ),
+                False,
+            )
+        else:
+            return (
+                ToolErrorPayload(
+                    code="TOOL_EXECUTION_FAILED",
+                    message=f"Tool {tool.name} failed: {exc}",
+                    retryable=False,
+                ),
+                False,
+            )
+
+        retryable = code in tool.retryable_errors
+        if not tool.side_effect:
+            retryable = True
+        if tool.side_effect and not self._safe_side_effect_retry(
+            tool=tool,
+            tool_call_store=self.tool_call_store,
+        ):
+            retryable = False
+        return (
+            ToolErrorPayload(
+                code=code,
+                message=(
+                    f"Transient failure in {tool.name}: {exc}"
+                ),
+                retryable=retryable,
+            ),
+            False,
+        )
+
+    def _execute_handler_with_retry(
+        self,
+        *,
+        tool: ToolDefinition,
+        arguments: dict[str, Any],
+        idempotency_key: str | None,
+    ) -> dict[str, Any]:
+        for attempt in range(1, tool.max_attempts + 1):
+            try:
+                return self._invoke_with_timeout(
+                    tool,
+                    arguments,
+                    idempotency_key,
+                )
+            except Exception as exc:
+                payload, response_lost = self._classify_handler_error(
+                    tool=tool,
+                    exc=exc,
+                )
+                if response_lost:
+                    raise ResponseLostToolError(payload) from exc
+                if payload.retryable and attempt < tool.max_attempts:
+                    if tool.backoff_seconds:
+                        time.sleep(
+                            tool.backoff_seconds * (2 ** (attempt - 1))
+                        )
+                    continue
+                if payload.retryable:
+                    raise RetryableToolError(payload) from exc
+                raise NonRetryableToolError(payload) from exc
+
+        raise NonRetryableToolError(
+            ToolErrorPayload(
+                code="TOOL_EXECUTION_FAILED",
+                message=f"Tool {tool.name} exhausted execution attempts",
+                retryable=False,
+            )
+        )
 
     @staticmethod
     def _now() -> datetime:
@@ -267,8 +458,12 @@ class ToolRuntime:
             result = existing.get("result_json")
             if isinstance(result, dict):
                 return result
-        raise PermanentRunError(
-            f"Tool call already exists for {tool.name}"
+        raise NonRetryableToolError(
+            ToolErrorPayload(
+                code="TOOL_CALL_IN_PROGRESS",
+                message=f"Tool call already exists for {tool.name}",
+                retryable=False,
+            )
         )
 
     def _prepare_idempotency(
@@ -279,8 +474,12 @@ class ToolRuntime:
         context: ToolContext | None,
     ) -> dict[str, Any] | None:
         if tool.idempotency_required and not idempotency_key:
-            raise PermanentRunError(
-                f"Idempotency key required for {tool.name}"
+            raise NonRetryableToolError(
+                ToolErrorPayload(
+                    code="TOOL_IDEMPOTENCY_REQUIRED",
+                    message=f"Idempotency key required for {tool.name}",
+                    retryable=False,
+                )
             )
 
         if idempotency_key is None:
@@ -288,13 +487,23 @@ class ToolRuntime:
 
         if self.tool_call_store is None:
             if tool.idempotency_required:
-                raise PermanentRunError(
-                    f"Tool call store is required for {tool.name} idempotency"
+                raise NonRetryableToolError(
+                    ToolErrorPayload(
+                        code="TOOL_IDEMPOTENCY_STORE_UNAVAILABLE",
+                        message=(
+                            f"Tool call store is required for {tool.name}"
+                        ),
+                        retryable=False,
+                    )
                 )
             return None
         if context is None:
-            raise PermanentRunError(
-                f"Tool context is required for {tool.name} idempotency"
+            raise NonRetryableToolError(
+                ToolErrorPayload(
+                    code="TOOL_CONTEXT_REQUIRED",
+                    message=f"Tool context is required for {tool.name}",
+                    retryable=False,
+                )
             )
 
         existing = self._existing_tool_call(
@@ -317,8 +526,14 @@ class ToolRuntime:
             return
 
         if context is None:
-            raise PermanentRunError(
-                f"Tool context is required for {tool.name} authorization"
+            raise NonRetryableToolError(
+                ToolErrorPayload(
+                    code="TOOL_CONTEXT_REQUIRED",
+                    message=(
+                        f"Tool context is required for {tool.name} authorization"
+                    ),
+                    retryable=False,
+                )
             )
 
         if tool.permission is not None:
@@ -326,12 +541,20 @@ class ToolRuntime:
             try:
                 allowed = checker(tool.permission, context)
             except PermissionError as exc:
-                raise PermanentRunError(
-                    f"Permission denied for {tool.name}: {exc}"
+                raise NonRetryableToolError(
+                    ToolErrorPayload(
+                        code="TOOL_PERMISSION_DENIED",
+                        message=f"Permission denied for {tool.name}: {exc}",
+                        retryable=False,
+                    )
                 ) from exc
             if not allowed:
-                raise PermanentRunError(
-                    f"Permission denied for {tool.name}"
+                raise NonRetryableToolError(
+                    ToolErrorPayload(
+                        code="TOOL_PERMISSION_DENIED",
+                        message=f"Permission denied for {tool.name}",
+                        retryable=False,
+                    )
                 )
 
         if self.resource_authorizer is not None:
@@ -342,12 +565,22 @@ class ToolRuntime:
                     context,
                 )
             except PermissionError as exc:
-                raise PermanentRunError(
-                    f"Resource access denied for {tool.name}: {exc}"
+                raise NonRetryableToolError(
+                    ToolErrorPayload(
+                        code="TOOL_PERMISSION_DENIED",
+                        message=(
+                            f"Resource access denied for {tool.name}: {exc}"
+                        ),
+                        retryable=False,
+                    )
                 ) from exc
             if not resource_allowed:
-                raise PermanentRunError(
-                    f"Resource access denied for {tool.name}"
+                raise NonRetryableToolError(
+                    ToolErrorPayload(
+                        code="TOOL_PERMISSION_DENIED",
+                        message=f"Resource access denied for {tool.name}",
+                        retryable=False,
+                    )
                 )
 
     @staticmethod
@@ -369,16 +602,24 @@ class ToolRuntime:
                 model = tool.input_schema.model_validate(arguments)
                 validated_arguments = model.model_dump()
             except (ValidationError, TypeError, ValueError) as exc:
-                raise PermanentRunError(
-                    f"Invalid arguments for {tool.name}: {exc}"
+                raise NonRetryableToolError(
+                    ToolErrorPayload(
+                        code="TOOL_VALIDATION_ERROR",
+                        message=f"Invalid arguments for {tool.name}: {exc}",
+                        retryable=False,
+                    )
                 ) from exc
 
         if tool.validate_arguments is not None:
             try:
                 tool.validate_arguments(validated_arguments)
             except (TypeError, ValueError, KeyError) as exc:
-                raise PermanentRunError(
-                    f"Invalid arguments for {tool.name}: {exc}"
+                raise NonRetryableToolError(
+                    ToolErrorPayload(
+                        code="TOOL_VALIDATION_ERROR",
+                        message=f"Invalid arguments for {tool.name}: {exc}",
+                        retryable=False,
+                    )
                 ) from exc
 
         return validated_arguments
@@ -395,8 +636,12 @@ class ToolRuntime:
             model = tool.output_schema.model_validate(result)
             return model.model_dump()
         except (ValidationError, TypeError, ValueError) as exc:
-            raise PermanentRunError(
-                f"Invalid result for {tool.name}: {exc}"
+            raise NonRetryableToolError(
+                ToolErrorPayload(
+                    code="TOOL_OUTPUT_VALIDATION_ERROR",
+                    message=f"Invalid result for {tool.name}: {exc}",
+                    retryable=False,
+                )
             ) from exc
 
     def execute(
@@ -425,8 +670,12 @@ class ToolRuntime:
         tool_call = None
         if self.tool_call_store is not None:
             if context is None:
-                raise PermanentRunError(
-                    f"Tool context is required to record {tool.name}"
+                raise NonRetryableToolError(
+                    ToolErrorPayload(
+                        code="TOOL_CONTEXT_REQUIRED",
+                        message=f"Tool context is required to record {tool.name}",
+                        retryable=False,
+                    )
                 )
             tool_call = self._start_tool_call(
                 tool=tool,
@@ -436,7 +685,11 @@ class ToolRuntime:
             )
 
         try:
-            result = tool.handler(validated_arguments, idempotency_key)
+            result = self._execute_handler_with_retry(
+                tool=tool,
+                arguments=validated_arguments,
+                idempotency_key=idempotency_key,
+            )
             validated_result = self._validate_output(tool, result)
             if tool_call is not None:
                 self._update_tool_call(
@@ -448,47 +701,38 @@ class ToolRuntime:
                     },
                 )
             return validated_result
-        except (TimeoutError, ConnectionError) as exc:
+        except ResponseLostToolError as exc:
             if tool_call is not None:
                 self._update_tool_call(
                     call=tool_call,
                     updates={
-                        "status": "failed",
-                        "error_json": {
-                            "type": type(exc).__name__,
-                            "message": str(exc),
-                        },
+                        "status": "response_lost",
+                        "error_json": exc.tool_error,
                         "ended_at": self._now(),
                     },
                 )
-            raise TransientRunError(
-                f"Transient failure in {tool.name}: {exc}"
-            ) from exc
-        except PermissionError as exc:
+            raise
+        except (RetryableToolError, NonRetryableToolError) as exc:
             if tool_call is not None:
                 self._update_tool_call(
                     call=tool_call,
                     updates={
                         "status": "failed",
-                        "error_json": {
-                            "type": type(exc).__name__,
-                            "message": str(exc),
-                        },
+                        "error_json": exc.tool_error,
                         "ended_at": self._now(),
                     },
                 )
-            raise PermanentRunError(
-                f"Permission denied for {tool.name}: {exc}"
-            ) from exc
-        except Exception as exc:
+            raise
+        except PermanentRunError as exc:
             if tool_call is not None:
                 self._update_tool_call(
                     call=tool_call,
                     updates={
                         "status": "failed",
                         "error_json": {
-                            "type": type(exc).__name__,
+                            "code": "TOOL_OUTPUT_VALIDATION_ERROR",
                             "message": str(exc),
+                            "retryable": False,
                         },
                         "ended_at": self._now(),
                     },

@@ -1,5 +1,10 @@
 from services.run_errors import PermanentRunError
-from services.tool_runtime import ToolContext, ToolDefinition, ToolRuntime
+from services.tool_runtime import (
+    NonRetryableToolError,
+    ToolContext,
+    ToolDefinition,
+    ToolRuntime,
+)
 
 
 class InMemoryToolCallStore:
@@ -118,11 +123,11 @@ def test_runtime_updates_same_call_to_failed_when_handler_errors():
             idempotency_key="refund:ORD-10086:T-9527:v1",
             context=_context(),
         )
-    except ValueError as exc:
-        assert str(exc) == "payment rejected"
+    except NonRetryableToolError as exc:
+        assert "payment rejected" in str(exc)
     else:
         raise AssertionError("handler error was swallowed")
 
     assert len(store.calls) == 1
     assert store.calls[0]["status"] == "failed"
-    assert store.calls[0]["error_json"]["message"] == "payment rejected"
+    assert "payment rejected" in store.calls[0]["error_json"]["message"]
