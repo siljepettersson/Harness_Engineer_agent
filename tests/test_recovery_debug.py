@@ -7,7 +7,18 @@ from database import SessionLocal
 from main import app
 from models import AgentRun, AgentStep, AuditLog, Checkpoint, DeadLetterJob, ModelCall, OutboxJob, RunEvent, ToolCall, UsageRecord
 from repositories.run_repository import run_repository
-from services.reconciliation import DownstreamUnavailable, reconcile_once
+from services.reconciliation import (
+    DownstreamUnavailable,
+    reconcile_once,
+    reconcile_refunds_once,
+)
+from services.refund_gateway import (
+    FakeRefundGateway,
+    HttpRefundGateway,
+    RefundGatewayUnavailable,
+    refund_idempotency_key,
+)
+from services.queue_inspector import RedisQueueInspector
 from httpx import ASGITransport, AsyncClient
 import anyio
 from main import app
@@ -151,3 +162,121 @@ def test_api_smoke_create_stuck_sweep_trace_and_replay():
                 "run.requeued_by_sweeper"
             )
     anyio.run(scenario)
+
+
+def test_fake_refund_gateway_is_idempotent_and_queryable():
+    gateway = FakeRefundGateway()
+    key = refund_idempotency_key("ORD-10086", "T-9527")
+
+    first = gateway.refund(
+        order_id="ORD-10086", ticket_id="T-9527", amount=39.9,
+        idempotency_key=key,
+    )
+    duplicate = gateway.refund(
+        order_id="ORD-10086", ticket_id="T-9527", amount=39.9,
+        idempotency_key=key,
+    )
+
+    assert first["refund_id"] == "RF-2201"
+    assert duplicate["refund_id"] == first["refund_id"]
+    assert duplicate["duplicate"] is True
+    assert gateway.request_count == 2
+    assert gateway.get_by_idempotency_key(key)["refund_id"] == "RF-2201"
+
+
+def test_fake_refund_gateway_commits_then_loses_response():
+    gateway = FakeRefundGateway()
+    key = refund_idempotency_key("ORD-10086", "T-9527")
+
+    try:
+        gateway.refund_then_lose_response(
+            order_id="ORD-10086", ticket_id="T-9527", amount=39.9,
+            idempotency_key=key,
+        )
+    except TimeoutError:
+        pass
+    else:
+        raise AssertionError("expected a lost response")
+
+    assert gateway.get_by_idempotency_key(key)["refund_id"] == "RF-2201"
+
+    gateway.query_available = False
+    try:
+        gateway.get_by_idempotency_key(key)
+    except RefundGatewayUnavailable:
+        pass
+    else:
+        raise AssertionError("expected provider query failure")
+
+
+def test_fake_gateway_reconciliation_recovers_one_refund():
+    _clean()
+    run_id = _run()
+    gateway = FakeRefundGateway()
+    key = refund_idempotency_key("ORD-10086", "T-9527")
+    try:
+        gateway.refund_then_lose_response(
+            order_id="ORD-10086", ticket_id="T-9527", amount=39.9,
+            idempotency_key=key,
+        )
+    except TimeoutError:
+        pass
+
+    with SessionLocal.begin() as db:
+        db.add(ToolCall(
+            id="tc-fake-refund", run_id=run_id, tool_name="refund_order",
+            args_json={"order_id": "ORD-10086", "amount": 39.9},
+            status="response_lost", idempotency_key=key,
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+        ))
+
+    result = reconcile_refunds_once(gateway)
+    assert result["repaired"] == 1
+    assert gateway.get_by_idempotency_key(key)["refund_id"] == "RF-2201"
+    assert gateway.request_count == 1
+    with SessionLocal() as db:
+        call = db.get(ToolCall, "tc-fake-refund")
+    assert call.status == "succeeded"
+    assert call.result_json["refund_id"] == "RF-2201"
+
+
+def test_http_gateway_maps_business_request_and_lookup_path_without_network():
+    class StubGateway(HttpRefundGateway):
+        def __init__(self):
+            super().__init__("https://payments.example", token="secret")
+            self.calls = []
+
+        def _request(self, method, path, body=None):
+            self.calls.append((method, path, body))
+            return {"refund_id": "RF-2201", "status": "succeeded"}
+
+    gateway = StubGateway()
+    key = refund_idempotency_key("ORD-10086", "T-9527")
+    gateway.refund(
+        order_id="ORD-10086", ticket_id="T-9527", amount=39.9,
+        idempotency_key=key,
+    )
+    gateway.get_by_idempotency_key(key)
+    assert gateway.calls[0] == (
+        "POST", "/refunds", {
+            "order_id": "ORD-10086", "ticket_id": "T-9527",
+            "amount": 39.9, "idempotency_key": key,
+        }
+    )
+    assert gateway.calls[1][0:2] == (
+        "GET", "/refunds/by-idempotency-key/refund%3AORD-10086%3AT-9527%3Av1"
+    )
+
+
+def test_redis_queue_inspector_is_read_only_and_reports_depth():
+    class Client:
+        def ping(self):
+            return True
+
+        def llen(self, name):
+            assert name == "agent_runs"
+            return 4
+
+    assert RedisQueueInspector(Client()).snapshot() == {
+        "queue": "agent_runs", "reachable": True, "depth": 4,
+    }

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, Header, Query
 
 from services.reconciliation import reconcile_once
+from services.queue_inspector import RedisQueueInspector
 from repositories.run_repository import run_repository
 from sweeper import sweep_once
 
@@ -52,3 +53,8 @@ async def reconcile_unconfigured():
 
     return reconcile_once(unavailable)
 
+
+@router.get("/queue")
+async def queue_snapshot():
+    """Read-only Redis/Celery queue telemetry; Outbox remains authoritative."""
+    return RedisQueueInspector.from_env().snapshot()

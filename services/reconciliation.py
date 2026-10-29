@@ -14,6 +14,7 @@ from sqlalchemy import select
 from database import SessionLocal
 from models import AgentRun, ToolCall
 from repositories.run_repository import SqlAlchemyRunRepository, run_repository
+from services.refund_gateway import RefundGateway, RefundGatewayUnavailable
 
 
 class DownstreamUnavailable(RuntimeError):
@@ -21,6 +22,33 @@ class DownstreamUnavailable(RuntimeError):
 
 
 DownstreamQuery = Callable[[str, str], dict[str, Any] | None]
+
+
+def query_from_refund_gateway(gateway: RefundGateway) -> DownstreamQuery:
+    """Adapt a refund provider to the generic reconciliation callback."""
+    def query(_tool_name: str, idempotency_key: str) -> dict[str, Any] | None:
+        try:
+            return gateway.get_by_idempotency_key(idempotency_key)
+        except RefundGatewayUnavailable as exc:
+            raise DownstreamUnavailable(str(exc)) from exc
+
+    return query
+
+
+def reconcile_refunds_once(
+    gateway: RefundGateway,
+    *,
+    repository: SqlAlchemyRunRepository = run_repository,
+    older_than_seconds: int = 300,
+    limit: int = 100,
+) -> dict[str, int]:
+    """Run reconciliation for a concrete refund gateway."""
+    return reconcile_once(
+        query_from_refund_gateway(gateway),
+        repository=repository,
+        older_than_seconds=older_than_seconds,
+        limit=limit,
+    )
 
 
 def reconcile_once(
@@ -90,4 +118,3 @@ def reconcile_once(
             )
         stats["repaired"] += 1
     return stats
-
