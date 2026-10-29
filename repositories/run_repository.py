@@ -26,6 +26,9 @@ from state_machine import (
 )
 
 
+MAX_RECOVERY_ATTEMPTS = 3
+
+
 class SqlAlchemyRunRepository:
     """SQLAlchemy persistence for runs and their event stream.
 
@@ -170,6 +173,23 @@ class SqlAlchemyRunRepository:
             "created_at": log.created_at.isoformat(),
         }
 
+    @staticmethod
+    def _outbox_to_dict(job: OutboxJob) -> dict[str, Any]:
+        return {
+            "id": job.id,
+            "job_type": job.job_type,
+            "payload_json": job.payload_json,
+            "status": job.status,
+            "attempts": job.attempts,
+            "max_attempts": job.max_attempts,
+            "next_attempt_at": job.next_attempt_at.isoformat(),
+            "last_error_json": job.last_error_json,
+            "created_at": job.created_at.isoformat(),
+            "dispatched_at": (
+                job.dispatched_at.isoformat() if job.dispatched_at else None
+            ),
+        }
+
     def _run_belongs_to_org(self, db, run_id: str, org_id: str) -> bool:
         return db.scalar(
             select(AgentRun.id).where(
@@ -312,7 +332,13 @@ class SqlAlchemyRunRepository:
             return True
 
     def recover_expired_leases(self, limit: int = 100) -> int:
-        """Return expired running leases to the queue with a new outbox job."""
+        """Recover expired leases without bypassing the run state machine.
+
+        The sweep is deliberately conservative: terminal runs are never
+        touched, a cancellation request wins over requeue, and recovery is
+        bounded by ``MAX_RECOVERY_ATTEMPTS``.  The transition, requeue event,
+        audit row and outbox job are committed together.
+        """
         now = datetime.now(timezone.utc)
         recovered = 0
         with SessionLocal.begin() as db:
@@ -330,27 +356,88 @@ class SqlAlchemyRunRepository:
 
             for run in runs:
                 previous_owner = run.lease_owner
-                self._transition_in_tx(
-                    db,
-                    run,
-                    to_status="queued",
-                    reason="worker_lease_expired",
-                    actor_type="system",
-                    actor_id="lease_sweeper",
-                    payload={"previous_owner": previous_owner},
-                )
-                db.add(
-                    OutboxJob(
-                        id=str(uuid4()),
-                        job_type="execute_run",
-                        payload_json={"run_id": run.id},
-                        status="pending",
-                        attempts=0,
-                        max_attempts=10,
-                        next_attempt_at=now,
-                        created_at=now,
+                if run.cancel_requested_at is not None:
+                    self._transition_in_tx(
+                        db, run, to_status="cancelled",
+                        reason="expired_worker_cancelled_run",
+                        actor_type="system", actor_id="lease_sweeper",
+                        payload={"previous_owner": previous_owner},
                     )
+                    recovered += 1
+                    continue
+
+                if run.attempts >= MAX_RECOVERY_ATTEMPTS:
+                    self._transition_in_tx(
+                        db, run, to_status="failed",
+                        reason="recovery_attempt_limit_exhausted",
+                        actor_type="system", actor_id="lease_sweeper",
+                        payload={
+                            "previous_owner": previous_owner,
+                            "attempts": run.attempts,
+                            "max_attempts": MAX_RECOVERY_ATTEMPTS,
+                        },
+                        error={
+                            "code": "RECOVERY_ATTEMPTS_EXHAUSTED",
+                            "attempts": run.attempts,
+                        },
+                    )
+                    recovered += 1
+                    continue
+
+                latest_checkpoint = db.scalar(
+                    select(Checkpoint)
+                    .where(Checkpoint.run_id == run.id)
+                    .order_by(Checkpoint.checkpoint_index.desc())
                 )
+                self._transition_in_tx(
+                    db, run, to_status="queued",
+                    reason="worker_lease_expired",
+                    actor_type="system", actor_id="lease_sweeper",
+                    payload={
+                        "previous_owner": previous_owner,
+                        "checkpoint_index": (
+                            latest_checkpoint.checkpoint_index
+                            if latest_checkpoint else None
+                        ),
+                    },
+                )
+                last_sequence = db.scalar(
+                    select(func.max(RunEvent.sequence)).where(
+                        RunEvent.run_id == run.id
+                    )
+                ) or 0
+                db.add(RunEvent(
+                    id=str(uuid4()), run_id=run.id,
+                    sequence=last_sequence + 1,
+                    event_type="run.requeued_by_sweeper",
+                    payload_json={
+                        "previous_owner": previous_owner,
+                        "checkpoint_index": (
+                            latest_checkpoint.checkpoint_index
+                            if latest_checkpoint else None
+                        ),
+                    },
+                    created_at=now,
+                ))
+                db.add(AuditLog(
+                    id=str(uuid4()), org_id=run.org_id,
+                    actor="system:lease_sweeper", run_id=run.id,
+                    action="run.requeued_by_sweeper",
+                    target_type="agent_run", target_id=run.id,
+                    metadata_json={
+                        "previous_owner": previous_owner,
+                        "checkpoint_index": (
+                            latest_checkpoint.checkpoint_index
+                            if latest_checkpoint else None
+                        ),
+                    }, created_at=now,
+                ))
+                db.add(OutboxJob(
+                    id=str(uuid4()), job_type="execute_run",
+                    payload_json={"run_id": run.id}, status="pending",
+                    attempts=0, max_attempts=10,
+                    next_attempt_at=now, created_at=now,
+                ))
                 recovered += 1
 
         return recovered
@@ -800,6 +887,126 @@ class SqlAlchemyRunRepository:
             ).all()
             return [self._event_to_dict(event) for event in events]
 
+    def list_stuck_runs(
+        self,
+        org_id: str,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return only running runs whose lease has expired."""
+        now = datetime.now(timezone.utc)
+        with SessionLocal() as db:
+            runs = db.scalars(
+                select(AgentRun)
+                .where(
+                    AgentRun.org_id == org_id,
+                    AgentRun.status == "running",
+                    AgentRun.lease_expires_at.is_not(None),
+                    AgentRun.lease_expires_at <= now,
+                )
+                .order_by(AgentRun.lease_expires_at.asc())
+                .limit(limit)
+            ).all()
+            result = []
+            for run in runs:
+                event = db.scalar(
+                    select(RunEvent)
+                    .where(RunEvent.run_id == run.id)
+                    .order_by(RunEvent.sequence.desc())
+                )
+                checkpoint = db.scalar(
+                    select(Checkpoint)
+                    .where(Checkpoint.run_id == run.id)
+                    .order_by(Checkpoint.checkpoint_index.desc())
+                )
+                result.append({
+                    "run_id": run.id,
+                    "status": run.status,
+                    "lease_owner": run.lease_owner,
+                    "lease_expires_at": (
+                        run.lease_expires_at.isoformat()
+                        if run.lease_expires_at else None
+                    ),
+                    "last_event": self._event_to_dict(event) if event else None,
+                    "latest_checkpoint": (
+                        self._checkpoint_to_dict(checkpoint)
+                        if checkpoint else None
+                    ),
+                })
+            return result
+
+    def reconcile_tool_call(
+        self,
+        *,
+        tool_call_id: str,
+        resolution: dict[str, Any],
+        event_type: str = "tool.repaired",
+        actor: str = "system:reconciliation",
+    ) -> dict[str, Any]:
+        """Atomically backfill a tool result, event and audit record."""
+        with SessionLocal.begin() as db:
+            call = db.scalar(
+                select(ToolCall).where(ToolCall.id == tool_call_id).with_for_update()
+            )
+            if call is None:
+                raise KeyError(tool_call_id)
+            run = db.get(AgentRun, call.run_id)
+            if run is None:
+                raise KeyError(call.run_id)
+            now = datetime.now(timezone.utc)
+            status = resolution.get("status", "succeeded")
+            call.status = status
+            call.result_json = resolution.get("result_json")
+            call.error_json = resolution.get("error_json")
+            call.ended_at = now
+            sequence = db.scalar(
+                select(func.max(RunEvent.sequence)).where(RunEvent.run_id == run.id)
+            ) or 0
+            db.add(RunEvent(
+                id=str(uuid4()), run_id=run.id, sequence=sequence + 1,
+                event_type=event_type,
+                payload_json={"tool_call_id": call.id, **resolution},
+                created_at=now,
+            ))
+            db.add(AuditLog(
+                id=str(uuid4()), org_id=run.org_id, actor=actor,
+                run_id=run.id, action="tool.reconcile",
+                target_type="tool_call", target_id=call.id,
+                metadata_json=resolution, created_at=now,
+            ))
+            db.flush()
+            return self._tool_call_to_dict(call)
+
+    def record_manual_review(
+        self,
+        *,
+        tool_call_id: str,
+        reason: str,
+        actor: str = "system:reconciliation",
+    ) -> dict[str, Any]:
+        """Record uncertainty without inventing a new run status."""
+        with SessionLocal.begin() as db:
+            call = db.scalar(select(ToolCall).where(ToolCall.id == tool_call_id))
+            if call is None:
+                raise KeyError(tool_call_id)
+            run = db.get(AgentRun, call.run_id)
+            now = datetime.now(timezone.utc)
+            sequence = db.scalar(
+                select(func.max(RunEvent.sequence)).where(RunEvent.run_id == run.id)
+            ) or 0
+            payload = {"tool_call_id": call.id, "reason": reason}
+            db.add(RunEvent(
+                id=str(uuid4()), run_id=run.id, sequence=sequence + 1,
+                event_type="tool.manual_review", payload_json=payload,
+                created_at=now,
+            ))
+            db.add(AuditLog(
+                id=str(uuid4()), org_id=run.org_id, actor=actor,
+                run_id=run.id, action="tool.manual_review",
+                target_type="tool_call", target_id=call.id,
+                metadata_json=payload, created_at=now,
+            ))
+            return self._tool_call_to_dict(call)
+
     def create_step(self, org_id: str, step: dict[str, Any]) -> dict[str, Any]:
         with SessionLocal.begin() as db:
             if not self._run_belongs_to_org(db, step["run_id"], org_id):
@@ -1105,14 +1312,42 @@ class SqlAlchemyRunRepository:
                 .where(Checkpoint.run_id == run_id)
                 .order_by(Checkpoint.checkpoint_index.asc())
             ).all()
+            # SQLite's JSON path support differs from PostgreSQL's.  Keep the
+            # trace portable and filter the small per-development outbox in
+            # Python rather than making recovery diagnostics database-specific.
+            outbox_jobs = [
+                job for job in db.scalars(
+                    select(OutboxJob).order_by(OutboxJob.created_at.asc())
+                ).all()
+                if job.payload_json.get("run_id") == run_id
+            ]
+            audit_logs = db.scalars(
+                select(AuditLog)
+                .where(AuditLog.run_id == run_id)
+                .order_by(AuditLog.created_at.asc())
+            ).all()
+            last_event = events[-1] if events else None
+            latest_checkpoint = checkpoints[-1] if checkpoints else None
 
             return {
                 "run": self._run_to_dict(run),
+                "last_event": self._event_to_dict(last_event) if last_event else None,
+                "latest_checkpoint": (
+                    self._checkpoint_to_dict(latest_checkpoint)
+                    if latest_checkpoint else None
+                ),
+                "failed_steps": [
+                    self._step_to_dict(step)
+                    for step in steps if step.status == "failed"
+                ],
                 "steps": [self._step_to_dict(step) for step in steps],
                 "events": [self._event_to_dict(event) for event in events],
                 "model_calls": [self._model_call_to_dict(call) for call in model_calls],
                 "tool_calls": [self._tool_call_to_dict(call) for call in tool_calls],
                 "checkpoints": [self._checkpoint_to_dict(checkpoint) for checkpoint in checkpoints],
+                "outbox_jobs": [self._outbox_to_dict(job) for job in outbox_jobs],
+                "job_queue": [self._outbox_to_dict(job) for job in outbox_jobs],
+                "audit_logs": [self._audit_to_dict(log) for log in audit_logs],
             }
 
 

@@ -7,6 +7,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from database import init_db
 from routes.runs import router as runs_router
+from routes.debug import router as debug_router
 from services.run_service import ServiceError
 from state_machine import UnauthorizedRunActor
 
@@ -19,6 +20,7 @@ init_db()
 
 
 app.include_router(runs_router)
+app.include_router(debug_router)
 
 
 def _request_id(request: Request) -> str:

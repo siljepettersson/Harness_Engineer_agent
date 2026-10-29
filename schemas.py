@@ -65,7 +65,13 @@ class RunEventRecord(BaseModel):
 class TraceResponse(BaseModel):
     run: RunResponse
     events: list[RunEventRecord]
+    last_event: dict[str, Any] | None = None
+    latest_checkpoint: dict[str, Any] | None = None
+    failed_steps: list[dict[str, Any]] = Field(default_factory=list)
     steps: list[dict[str, Any]]
     model_calls: list[dict[str, Any]]
     tool_calls: list[dict[str, Any]]
     checkpoints: list[dict[str, Any]]
+    outbox_jobs: list[dict[str, Any]] = Field(default_factory=list)
+    job_queue: list[dict[str, Any]] = Field(default_factory=list)
+    audit_logs: list[dict[str, Any]] = Field(default_factory=list)
