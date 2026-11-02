@@ -1,0 +1,31 @@
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+add_library(harness_event_validator event_sequence_validator.cpp)
+target_include_directories(harness_event_validator PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_library(harness_idempotency_validator idempotency_key_validator.cpp)
+target_include_directories(harness_idempotency_validator PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_library(harness_recovery_validator recovery_invariant_checker.cpp)
+target_include_directories(harness_recovery_validator PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(harness_recovery_validator PUBLIC harness_event_validator)
+
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(harness_event_validator PRIVATE -Wall -Wextra -Werror)
+    target_compile_options(harness_idempotency_validator PRIVATE -Wall -Wextra -Werror)
+    target_compile_options(harness_recovery_validator PRIVATE -Wall -Wextra -Werror)
+endif()
+
+add_executable(event_sequence_validator_test event_sequence_validator_test.cpp)
+target_link_libraries(event_sequence_validator_test PRIVATE harness_event_validator)
+add_test(NAME event_sequence_validator_test COMMAND event_sequence_validator_test)
+
+add_executable(idempotency_key_validator_test idempotency_key_validator_test.cpp)
+target_link_libraries(idempotency_key_validator_test PRIVATE harness_idempotency_validator)
+add_test(NAME idempotency_key_validator_test COMMAND idempotency_key_validator_test)
+
+add_executable(recovery_invariant_checker_test recovery_invariant_checker_test.cpp)
+target_link_libraries(recovery_invariant_checker_test PRIVATE harness_recovery_validator)
+add_test(NAME recovery_invariant_checker_test COMMAND recovery_invariant_checker_test)
