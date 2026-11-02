@@ -29,3 +29,11 @@ add_test(NAME idempotency_key_validator_test COMMAND idempotency_key_validator_t
 add_executable(recovery_invariant_checker_test recovery_invariant_checker_test.cpp)
 target_link_libraries(recovery_invariant_checker_test PRIVATE harness_recovery_validator)
 add_test(NAME recovery_invariant_checker_test COMMAND recovery_invariant_checker_test)
+
+add_executable(validator_cli validator_cli.cpp)
+target_link_libraries(validator_cli PRIVATE harness_event_validator harness_idempotency_validator)
+
+add_test(
+    NAME validator_cli_key_test
+    COMMAND validator_cli key refund:ORD-10086:T-9527:v1 ORD-10086 T-9527
+)

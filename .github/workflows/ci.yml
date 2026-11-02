@@ -29,3 +29,7 @@ jobs:
         run: cmake --build build --parallel
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: CLI smoke test
+        run: |
+          printf 'e1 run_123 1 run.created\ne2 run_123 2 run.completed\n' \
+            | build/cpp/validator_cli events
