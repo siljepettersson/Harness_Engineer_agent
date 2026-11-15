@@ -14,8 +14,8 @@ from state_machine import UnauthorizedRunActor
 
 app = FastAPI(title="Agent Harness API", version="1.0.0")
 
-# The teaching project uses create_all during import. A production service
-# should run Alembic migrations before the application starts.
+# Development startup uses create_all. Production deployments should run
+# versioned database migrations before the application starts.
 init_db()
 
 
