@@ -1,5 +1,5 @@
 [project]
-name = "harness-engineer-agent"
+name = "agent-harness"
 version = "0.1.0"
 description = "Durable runtime for resumable, observable agent runs"
 requires-python = ">=3.11"

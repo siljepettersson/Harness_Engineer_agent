@@ -668,7 +668,7 @@ def test_run_loop_reuses_succeeded_tool_call_after_recovery():
             {
                 "role": "assistant",
                 "content": {
-                    "text": "查订单",
+                    "text": "Look up order",
                     "tool_use": {
                         "id": "tc_get_order_1",
                         "name": "get_order",

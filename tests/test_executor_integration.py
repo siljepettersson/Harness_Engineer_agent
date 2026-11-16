@@ -45,7 +45,7 @@ def test_real_repository_executes_four_model_rounds_and_three_tools():
                 provider="fake",
                 model="fake-model",
                 response_json={
-                    "text": "查订单",
+                    "text": "Look up order",
                     "tool_use": {
                         "id": "tc_get_order_1",
                         "name": "get_order",
